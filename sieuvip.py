@@ -127,8 +127,6 @@ class RobloxRejoinEngine:
 
     def _load_config(self) -> Dict:
         default_cfg = {
-            "check_ui_time": 180,
-            "auto_block": True,
             "auto_resize": False,
             "auto_arrange": False,
             "packages": [],
@@ -254,6 +252,14 @@ class RobloxRejoinEngine:
             time.sleep(1.5)
             return
 
+        # Hỏi thời gian lặp lại trước khi chạy
+        print(f"\n{Colors.CYAN}--- Cài đặt thời gian chạy ---{Colors.RESET}")
+        try:
+            raw_time = input(f"{Colors.MAGENTA}Nhập thời gian lặp lại để đóng tab (phút) [Nhập 0 để không đóng]: {Colors.RESET}").strip()
+            interval_seconds = int(float(raw_time) * 60) if raw_time else 0
+        except ValueError:
+            interval_seconds = 0
+
         print(f"{Colors.YELLOW}[*] Đang khởi tạo luồng & trích xuất Username...{Colors.RESET}")
         
         self.status_map = {p: "Đang nạp..." for p in pkgs}
@@ -267,12 +273,21 @@ class RobloxRejoinEngine:
         ui_thread.start()
 
         try:
-            # --- VÒNG LẶP CHÍNH AUTO REJOIN ---
             while True:
+                # --- KIỂM TRA CHẠY NỀN (BACKGROUND CHECK) ---
+                self.global_status = "Đang kiểm tra tiến trình chạy ngầm..."
+                for pkg in pkgs:
+                    self.status_map[pkg] = "Kiểm tra chạy nền..."
+                    ok, out = self.device.exec_cmd(f"pidof {pkg}")
+                    if ok and out.strip():
+                        self.status_map[pkg] = "Phát hiện chạy ngầm -> Đóng"
+                        self.device.kill_package(pkg)
+                        time.sleep(1)
+
                 # --- ĐỢT 1: Lướt qua toàn bộ app (Force Stop -> Mở lại sảnh) ---
                 self.global_status = "Đang chạy Đợt 1: Khởi động app vào sảnh..."
                 for pkg in pkgs:
-                    self.status_map[pkg] = "Đợt 1: Đóng app..."
+                    self.status_map[pkg] = "Đợt 1: Force Stop..."
                     self.device.kill_package(pkg)
                     time.sleep(1.5)
                     self.status_map[pkg] = "Đợt 1: Mở sảnh..."
@@ -318,14 +333,20 @@ class RobloxRejoinEngine:
                     time.sleep(3)
                     self.status_map[pkg] = "Joined"
 
-                # --- CHỜ ĐẾN CHU KỲ TIẾP THEO ---
-                interval = self.config.get("check_ui_time", 180)
-                for remaining in range(interval, 0, -1):
-                    self.global_status = f"Chu kỳ tiếp theo sau: {remaining} giây"
-                    time.sleep(1)
+                # --- XỬ LÝ THỜI GIAN LẶP (0 = Treo nguyên, >0 = Đếm lùi) ---
+                if interval_seconds <= 0:
+                    self.global_status = "Hoàn tất! Các tab đang được giữ nguyên (Không tự động đóng)."
+                    while True:
+                        time.sleep(1) # Treo UI vĩnh viễn ở trạng thái hiển thị
+                else:
+                    for remaining in range(interval_seconds, 0, -1):
+                        mins = remaining // 60
+                        secs = remaining % 60
+                        self.global_status = f"Chu kỳ khởi động lại tiếp theo sau: {mins} phút {secs} giây"
+                        time.sleep(1)
 
         except KeyboardInterrupt:
-            # Thoát mượt mà khi người dùng bấm Ctrl+C
+            # Bắt sự kiện thoát Ctrl+C
             pass
         finally:
             self.ui_running = False
