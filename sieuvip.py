@@ -64,15 +64,20 @@ class DeviceController:
         cmd_primary = f"am start"
         if freeform:
             cls.exec_cmd("settings put global enable_freeform_support 1")
+            cls.exec_cmd("settings put global force_resizable_activities 1")
             cmd_primary += " --windowingMode 5"
-        if bounds:
-            cmd_primary += f" --bounds {bounds}"
+            if bounds:
+                cmd_primary += f" --bounds {bounds}"
             
         cmd_primary += f" -n {pkg}/com.roblox.client.ActivityProtocolLaunch -a android.intent.action.VIEW -d '{intent_url}'"
         
         ok, out = cls.exec_cmd(cmd_primary)
         if not ok or "Error" in out or "Exception" in out:
             cmd_fallback = f"am start -p {pkg} -a android.intent.action.VIEW -d '{intent_url}'"
+            if freeform:
+                cmd_fallback = f"am start --windowingMode 5"
+                if bounds: cmd_fallback += f" --bounds {bounds}"
+                cmd_fallback += f" -p {pkg} -a android.intent.action.VIEW -d '{intent_url}'"
             cls.exec_cmd(cmd_fallback)
 
     @classmethod
@@ -112,10 +117,10 @@ class RobloxRejoinEngine:
         self.config: Dict = self._load_config()
         self.device = DeviceController()
         
-        # State variables for Live TUI Thread
         self.status_map: Dict[str, str] = {}
         self.username_map: Dict[str, str] = {}
         self.ui_running = False
+        self.global_status = "Đang khởi tạo..."
         
         self._last_cpu_idle = 0
         self._last_cpu_total = 0
@@ -177,7 +182,6 @@ class RobloxRejoinEngine:
         return place_id, job_id, link_code
 
     def get_system_stats(self) -> Tuple[str, str]:
-        # RAM
         ram_usage = "N/A"
         try:
             with open('/proc/meminfo', 'r') as f:
@@ -192,7 +196,6 @@ class RobloxRejoinEngine:
                 ram_usage = f"{((t - f - b - c) / t) * 100:.1f}%"
         except: pass
 
-        # CPU
         cpu_usage = "N/A"
         try:
             with open('/proc/stat', 'r') as f:
@@ -211,13 +214,18 @@ class RobloxRejoinEngine:
 
     def get_screen_size(self) -> Tuple[int, int]:
         ok, out = self.device.exec_cmd("wm size")
+        w, h = 720, 1280
         if ok and out:
-            nums = re.findall(r'\d+', out.splitlines()[-1])
-            if len(nums) >= 2:
-                return int(nums[-2]), int(nums[-1])
-        return 1080, 1920
+            for line in out.splitlines():
+                if "size:" in line:
+                    try:
+                        parts = line.split(":")[-1].strip().lower().split("x")
+                        w, h = int(parts[0]), int(parts[1])
+                    except: pass
+        return w, h
 
     def live_dashboard_thread(self):
+        """Thread chạy ngầm để render UI liên tục mỗi 1 giây"""
         while self.ui_running:
             cpu, ram = self.get_system_stats()
             os.system("cls" if os.name == "nt" else "clear")
@@ -225,18 +233,18 @@ class RobloxRejoinEngine:
             
             w_pkg, w_usr, w_stt = 22, 16, 30
             
-            # Header
             print(f"┌{'─' * w_pkg}┬{'─' * w_usr}┬{'─' * w_stt}┐")
             print(f"│ {Colors.MAGENTA}{'Package':<{w_pkg-1}}{Colors.RESET}│ {Colors.MAGENTA}{'Username':<{w_usr-1}}{Colors.RESET}│ {Colors.MAGENTA}{'Status':<{w_stt-1}}{Colors.RESET}│")
             print(f"├{'─' * w_pkg}┼{'─' * w_usr}┼{'─' * w_stt}┤")
             
-            # Rows
             for pkg in self.config.get("packages", []):
                 usr = self.username_map.get(pkg, "Unknown")
                 stt = self.status_map.get(pkg, "Waiting...")
                 print(f"│ {Colors.CYAN}{pkg:<{w_pkg-1}}{Colors.RESET}│ {Colors.GREEN}{usr:<{w_usr-1}}{Colors.RESET}│ {Colors.GREEN}{stt:<{w_stt-1}}{Colors.RESET}│")
                 
             print(f"└{'─' * w_pkg}┴{'─' * w_usr}┴{'─' * w_stt}┘")
+            print(f"\n{Colors.YELLOW}[*] {self.global_status}{Colors.RESET}")
+            print(f"{Colors.MAGENTA}Bấm Ctrl+C để dừng và quay lại menu chính...{Colors.RESET}")
             time.sleep(1)
 
     def run_rejoin_sequence(self, with_bypass: bool = False) -> None:
@@ -248,69 +256,80 @@ class RobloxRejoinEngine:
 
         print(f"{Colors.YELLOW}[*] Đang khởi tạo luồng & trích xuất Username...{Colors.RESET}")
         
-        # Prepare state map
         self.status_map = {p: "Đang nạp..." for p in pkgs}
         self.username_map = {}
         for p in pkgs:
             cookie = self.config.get("cookies", {}).get(p)
             self.username_map[p] = self.fetch_username(cookie) if cookie else "Unknown"
 
-        # Khởi chạy Thread UI
         self.ui_running = True
         ui_thread = threading.Thread(target=self.live_dashboard_thread, daemon=True)
         ui_thread.start()
 
-        # --- ĐỢT 1: Đóng và Mở App (Không Join) ---
-        for pkg in pkgs:
-            self.status_map[pkg] = "Đợt 1: Đóng app..."
-            self.device.kill_package(pkg)
-            time.sleep(1)
-            self.status_map[pkg] = "Đợt 1: Mở sảnh..."
-            self.device.exec_cmd(f"monkey -p {pkg} -c android.intent.category.LAUNCHER 1 > /dev/null 2>&1")
-            time.sleep(2)
+        try:
+            # --- VÒNG LẶP CHÍNH AUTO REJOIN ---
+            while True:
+                # --- ĐỢT 1: Lướt qua toàn bộ app (Force Stop -> Mở lại sảnh) ---
+                self.global_status = "Đang chạy Đợt 1: Khởi động app vào sảnh..."
+                for pkg in pkgs:
+                    self.status_map[pkg] = "Đợt 1: Đóng app..."
+                    self.device.kill_package(pkg)
+                    time.sleep(1.5)
+                    self.status_map[pkg] = "Đợt 1: Mở sảnh..."
+                    self.device.exec_cmd(f"monkey -p {pkg} -c android.intent.category.LAUNCHER 1 > /dev/null 2>&1")
+                    time.sleep(2)
 
-        # Cấu hình tính toán Bounds cho Đợt 2
-        auto_rs = self.config.get("auto_resize", False)
-        auto_ar = self.config.get("auto_arrange", False)
-        freeform_enabled = auto_rs or auto_ar
-        grid_bounds = []
-        
-        if auto_ar:
-            w, h = self.get_screen_size()
-            n = len(pkgs)
-            cols = math.ceil(math.sqrt(n))
-            rows = math.ceil(n / cols)
-            sw, sh = w // cols, h // rows
-            for i in range(n):
-                left, top = (i % cols) * sw, (i // cols) * sh
-                grid_bounds.append(f"{left},{top},{left+sw},{top+sh}")
+                # --- Lấy cấu hình Config 13 để áp dụng cho Đợt 2 ---
+                auto_rs = self.config.get("auto_resize", False)
+                auto_ar = self.config.get("auto_arrange", False)
+                freeform_enabled = auto_rs or auto_ar
+                grid_bounds = []
+                
+                if auto_ar:
+                    w, h = self.get_screen_size()
+                    n = len(pkgs)
+                    cols = math.ceil(math.sqrt(n))
+                    rows = math.ceil(n / cols)
+                    sw, sh = w // cols, h // rows
+                    for i in range(n):
+                        left, top = (i % cols) * sw, (i // cols) * sh
+                        grid_bounds.append(f"{left},{top},{left+sw},{top+sh}")
 
-        # --- ĐỢT 2: Đóng và Join Game (Kèm Config 13) ---
-        for i, pkg in enumerate(pkgs):
-            self.status_map[pkg] = "Đợt 2: Force Stop..."
-            link = self.config.get("server_links", {}).get(pkg, "")
-            place_id, job_id, link_code = self.parse_place_info(link)
-            
-            if not place_id:
-                self.status_map[pkg] = "Lỗi: Không có Place ID"
-                continue
+                # --- ĐỢT 2: Đóng toàn bộ app -> Mở lại + Config 13 + Join Game ID ---
+                self.global_status = "Đang chạy Đợt 2: Join Game & Chỉnh Size..."
+                for i, pkg in enumerate(pkgs):
+                    self.status_map[pkg] = "Đợt 2: Force Stop..."
+                    self.device.kill_package(pkg)
+                    time.sleep(1.5)
+                    
+                    link = self.config.get("server_links", {}).get(pkg, "")
+                    place_id, job_id, link_code = self.parse_place_info(link)
+                    
+                    if not place_id:
+                        self.status_map[pkg] = "Lỗi: Không có Place ID"
+                        continue
 
-            if with_bypass: self.device.set_android_id(os.urandom(8).hex())
-            
-            self.status_map[pkg] = "Đợt 2: Đang Join..."
-            
-            b_str = grid_bounds[i] if auto_ar else ("0,0,800,600" if auto_rs else None)
-            
-            self.device.launch_place(pkg, place_id, job_id, link_code, freeform=freeform_enabled, bounds=b_str)
-            time.sleep(2.5)
-            self.status_map[pkg] = "Joined"
+                    if with_bypass: self.device.set_android_id(os.urandom(8).hex())
+                    
+                    self.status_map[pkg] = "Đợt 2: Đang Join..."
+                    b_str = grid_bounds[i] if auto_ar else ("0,0,600,800" if auto_rs else None)
+                    
+                    self.device.launch_place(pkg, place_id, job_id, link_code, freeform=freeform_enabled, bounds=b_str)
+                    time.sleep(3)
+                    self.status_map[pkg] = "Joined"
 
-        time.sleep(2) # Hold UI for 2 seconds to view results
-        self.ui_running = False
-        ui_thread.join()
-        
-        print(f"\n{Colors.GREEN}[+] Hoàn tất toàn bộ chu trình Rejoin!{Colors.RESET}")
-        input(f"{Colors.MAGENTA}Bấm Enter để quay lại menu chính...{Colors.RESET}")
+                # --- CHỜ ĐẾN CHU KỲ TIẾP THEO ---
+                interval = self.config.get("check_ui_time", 180)
+                for remaining in range(interval, 0, -1):
+                    self.global_status = f"Chu kỳ tiếp theo sau: {remaining} giây"
+                    time.sleep(1)
+
+        except KeyboardInterrupt:
+            # Thoát mượt mà khi người dùng bấm Ctrl+C
+            pass
+        finally:
+            self.ui_running = False
+            ui_thread.join(timeout=2)
 
     def filter_and_select_packages(self) -> None:
         print(f"\n{Colors.CYAN}[*] Đang quét hệ thống...{Colors.RESET}")
@@ -323,6 +342,16 @@ class RobloxRejoinEngine:
         
         for i, p in enumerate(matched, start=1): print(f"  {i}. {p}")
         link = input(f"\n{Colors.MAGENTA}Nhập Server Link / Place ID: {Colors.RESET}").strip()
+        self.config["packages"] = matched
+        for p in matched: self.config.setdefault("server_links", {})[p] = link
+        self._save_config()
+        time.sleep(1)
+
+    def auto_assign_all(self) -> None:
+        link = input(f"\n{Colors.MAGENTA}Nhập 1 Link áp dụng cho tất cả Roblox packages: {Colors.RESET}").strip()
+        all_pkgs = self.device.get_all_packages()
+        matched = [p for p in all_pkgs if "roblox" in p.lower() or "clone" in p.lower()]
+        if not matched: return
         self.config["packages"] = matched
         for p in matched: self.config.setdefault("server_links", {})[p] = link
         self._save_config()
@@ -383,7 +412,7 @@ class SieuVipProApp:
 
         menu_data = [
             ("Auto Rejoin", [(1, "Start auto rejoin"), (2, "Start auto rejoin with bypass")]),
-            ("Server Setup", [(3, "Select packages & assign server link"), (4, "List selected packages"), (5, "Auto-select all Roblox packages with one link")]),
+            ("Server Setup", [(3, "Select packages & assign server link"), (4, "List selected packages"), (5, "Auto-select all Roblox packages")]),
             ("Tabs", [(6, "Open all Roblox tabs")]),
             ("Account / Cookie", [(7, "Login via cookie"), (8, "Logout Roblox"), (9, "Fix login cookie"), (10, "Export cookies")]),
             ("System", [(11, "Set Android ID"), (12, "Download APK")]),
@@ -405,6 +434,7 @@ class SieuVipProApp:
             1: lambda: self.engine.run_rejoin_sequence(with_bypass=False),
             2: lambda: self.engine.run_rejoin_sequence(with_bypass=True),
             3: self.engine.filter_and_select_packages,
+            5: self.engine.auto_assign_all,
             7: self.engine.login_via_cookie_menu,
             13: self.engine.handle_config_menu,
             0: lambda: sys.exit(0)
