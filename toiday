@@ -1,31 +1,34 @@
 #!/data/data/com.termux/files/usr/bin/bash
 
-# 1. Cấp quyền truy cập bộ nhớ & cài đặt Python
+# 1. Cấp quyền truy cập bộ nhớ & cài Python
 termux-setup-storage 2>/dev/null
 pkg update -y && pkg install -y python
 
-# 2. Đảm bảo thư mục Download tồn tại
+# 2. Đảm bảo thư mục Download tồn tại và tạo sẵn file cookie.txt
 mkdir -p /sdcard/Download
+if [ ! -f /sdcard/Download/cookie.txt ]; then
+    touch /sdcard/Download/cookie.txt
+    echo "# Dán mỗi dòng 1 mã Cookie .ROBLOSECURITY vào đây" > /sdcard/Download/cookie.txt
+fi
 
-# 3. Tải sieuvip.py từ GitHub và lưu thành /sdcard/Download/Hachimi.py
-echo "[*] Đang tải SieuVipPro về máy..."
+# 3. Tải mã nguồn sieuvip.py và lưu thành Hachimi.py
+echo "[*] Đang nạp mã nguồn SieuVipPro..."
 curl -k -L "https://raw.githubusercontent.com/TenKoCo/SieuVip/refs/heads/main/sieuvip.py" -o /sdcard/Download/Hachimi.py
 
-# 4. Kiểm tra nếu file tải về rỗng hoặc lỗi đường dẫn
 if [ ! -s /sdcard/Download/Hachimi.py ]; then
-    echo "[!] Tải thất bại. Vui lòng kiểm tra lại kết nối mạng hoặc file sieuvip.py trên repo!"
+    echo "[!] Tải thất bại. Hãy kiểm tra lại file sieuvip.py trên repo GitHub!"
     return 1 2>/dev/null || exit 1
 fi
 
-echo "[+] Tải thành công vào /sdcard/Download/Hachimi.py"
+echo "[+] Đã lưu mã nguồn: /sdcard/Download/Hachimi.py"
+echo "[+] File cookie sẵn sàng tại: /sdcard/Download/cookie.txt"
 
-# 5. Tạo shortcut 'sieuvip' để mở nhanh lần sau
+# 4. Tạo lối tắt 'sieuvip'
 cat << 'EOF' > /data/data/com.termux/files/usr/bin/sieuvip
 #!/data/data/com.termux/files/usr/bin/bash
 su -c "export PATH=$PATH:/data/data/com.termux/files/usr/bin && export TERM=xterm-256color && cd /sdcard/Download && python Hachimi.py"
 EOF
 chmod +x /data/data/com.termux/files/usr/bin/sieuvip
 
-# 6. Kích hoạt tool bằng lệnh su
-echo "[+] Khởi chạy tool..."
+# 5. Thực thi qua Root
 su -c "export PATH=$PATH:/data/data/com.termux/files/usr/bin && export TERM=xterm-256color && cd /sdcard/Download && python Hachimi.py"
