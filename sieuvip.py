@@ -33,11 +33,45 @@ class DeviceController:
 
     @classmethod
     def get_all_packages(cls) -> List[str]:
-        """Lấy toàn bộ danh sách package ứng dụng đã cài trên máy."""
-        success, out = cls.exec_cmd("pm list packages")
-        if not success or not out:
-            return []
-        return [line.replace("package:", "").strip() for line in out.splitlines() if line.strip()]
+        """Quét đa tầng toàn bộ package: Android PM (mọi User/Clone) + Quét thư mục /data/data/."""
+        packages = set()
+
+        # Tầng 1: Quét Package Manager của tất cả user profile (kèm app clone/không gian kép)
+        pm_commands = [
+            "pm list packages -u --user all",
+            "pm list packages -f",
+            "pm list packages"
+        ]
+        for cmd in pm_commands:
+            ok, out = cls.exec_cmd(cmd)
+            if ok and out:
+                for line in out.splitlines():
+                    clean_line = line.strip()
+                    if clean_line.startswith("package:"):
+                        pkg = clean_line.replace("package:", "").split("=")[-1].strip()
+                        if pkg:
+                            packages.add(pkg)
+
+        # Tầng 2: Quét trực tiếp thư mục /data/data/ (Yêu cầu Root) để bắt mọi app ẩn/clone
+        ok, data_out = cls.exec_cmd("ls -1 /data/data/")
+        if ok and data_out:
+            for item in data_out.splitlines():
+                item = item.strip()
+                if item and "." in item:
+                    packages.add(item)
+
+        # Tầng 3: Quét không gian Dual App (User 999 / Parallel Spaces)
+        ok, dual_out = cls.exec_cmd("ls -1 /data/user/ 2>/dev/null")
+        if ok and dual_out:
+            for uid in dual_out.splitlines():
+                uid = uid.strip()
+                if uid.isdigit() and uid != "0":
+                    _, u_apps = cls.exec_cmd(f"ls -1 /data/user/{uid}/ 2>/dev/null")
+                    for app in (u_apps.splitlines() if u_apps else []):
+                        if "." in app.strip():
+                            packages.add(app.strip())
+
+        return sorted(list(packages))
 
     @classmethod
     def kill_package(cls, pkg: str) -> None:
@@ -63,14 +97,13 @@ class DeviceController:
 
     @classmethod
     def inject_cookie_to_pkg(cls, pkg: str, raw_cookie: str) -> bool:
-        """Inject cookie ROBLOSECURITY trực tiếp vào shared_prefs XML của package."""
         c = raw_cookie.strip()
         if not c.startswith("_|WARNING:-DO-NOT-SHARE-THIS"):
             c = f"_|WARNING:-DO-NOT-SHARE-THIS.--Sharing-this-will-allow-someone-to-log-into-your-account-and-rob-your-robox.--|_{c}"
 
         xml_path = f"/data/data/{pkg}/shared_prefs/com.roblox.client_preferences.xml"
-        # Tạo file XML nếu chưa có hoặc thay thế session
         cmd = (
+            f"mkdir -p /data/data/{pkg}/shared_prefs && "
             f"if [ ! -f '{xml_path}' ]; then "
             f"echo '<?xml version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\" ?><map><string name=\"RBXSession\">{c}</string></map>' > '{xml_path}'; "
             f"else "
@@ -112,7 +145,7 @@ class RobloxRejoinEngine:
             return []
         try:
             with open(self.COOKIE_FILE, "r", encoding="utf-8") as f:
-                return [line.strip() for line in f.readlines() if line.strip()]
+                return [line.strip() for line in f.readlines() if line.strip() and not line.startswith("#")]
         except Exception:
             return []
 
@@ -129,60 +162,69 @@ class RobloxRejoinEngine:
         return place_id, job_id
 
     def filter_and_select_packages(self) -> None:
-        """Lọc packages theo từ khóa nhập vào (vd: 'free' -> lấy toàn bộ package có chứa chữ 'free')."""
-        keyword = input(f"\n{Colors.MAGENTA}Nhập từ khóa package cần quét (vd: free, roblox, clone): {Colors.RESET}").strip().lower()
+        print(f"\n{Colors.CYAN}[*] Đang quét toàn diện hệ thống (System, Clones, Dual Apps)...{Colors.RESET}")
+        all_pkgs = self.device.get_all_packages()
+        print(f"{Colors.GREEN}[+] Tổng số package phát hiện: {len(all_pkgs)}{Colors.RESET}")
+
+        keyword = input(f"\n{Colors.MAGENTA}Nhập từ khóa package (vd: free, roblox, vphone): {Colors.RESET}").strip().lower()
         if not keyword:
-            print(f"{Colors.RED}[!] Từ khóa không được để trống.{Colors.RESET}")
+            print(f"{Colors.RED}[!] Không được bỏ trống.{Colors.RESET}")
             time.sleep(1.5)
             return
 
-        all_pkgs = self.device.get_all_packages()
+        # Tìm kiếm không phân biệt hoa thường và loại bỏ khoảng trắng thừa
         matched = [p for p in all_pkgs if keyword in p.lower()]
 
         if not matched:
-            print(f"{Colors.RED}[!] Không tìm thấy package nào khớp với từ khóa '{keyword}'.{Colors.RESET}")
-            time.sleep(2)
-            return
+            print(f"{Colors.RED}[!] Vẫn không tìm thấy package nào chứa từ '{keyword}'.{Colors.RESET}")
+            # Hỗ trợ nhập thủ công nếu quét tự động không ra
+            manual = input(f"{Colors.YELLOW}Bạn có muốn tự gõ trực tiếp tên Package không? (y/n): {Colors.RESET}").strip().lower()
+            if manual == "y":
+                direct_pkg = input(f"{Colors.MAGENTA}Nhập chính xác tên package (vd: free.xxx.xxx): {Colors.RESET}").strip()
+                if direct_pkg:
+                    matched = [direct_pkg]
+                else:
+                    return
+            else:
+                time.sleep(1.5)
+                return
 
-        print(f"\n{Colors.GREEN}[+] Tìm thấy {len(matched)} packages khớp với '{keyword}':{Colors.RESET}")
+        print(f"\n{Colors.GREEN}[+] Danh sách Package khớp:{Colors.RESET}")
         for i, p in enumerate(matched, start=1):
             print(f"  {i}. {p}")
 
-        link = input(f"\n{Colors.MAGENTA}Nhập Server Link / Place ID áp dụng cho các package trên: {Colors.RESET}").strip()
-        if not link:
-            print(f"{Colors.YELLOW}[!] Chưa nhập link. Các package đã được chọn nhưng chưa có link.{Colors.RESET}")
+        link = input(f"\n{Colors.MAGENTA}Nhập Server Link / Place ID: {Colors.RESET}").strip()
 
         self.config["packages"] = matched
         for p in matched:
             self.config.setdefault("server_links", {})[p] = link
 
         self._save_config()
-        print(f"{Colors.GREEN}[+] Đã lưu {len(matched)} packages vào cấu hình.{Colors.RESET}")
+        print(f"{Colors.GREEN}[+] Đã lưu {len(matched)} packages.{Colors.RESET}")
         time.sleep(2)
 
     def login_via_cookie_menu(self) -> None:
-        """Menu xử lý đăng nhập Cookie từ file cookie.txt."""
         cookies = self._read_cookie_file()
         if not cookies:
-            print(f"\n{Colors.RED}[!] File cookie.txt tại /sdcard/Download/cookie.txt đang rỗng hoặc không tồn tại.{Colors.RESET}")
+            print(f"\n{Colors.RED}[!] File cookie.txt rỗng hoặc chưa nhập cookie hợp lệ.{Colors.RESET}")
             input(f"{Colors.MAGENTA}Bấm Enter để quay lại...{Colors.RESET}")
             return
 
-        print(f"\n{Colors.CYAN}--- Cookie Login Menu (Tìm thấy {len(cookies)} cookies) ---{Colors.RESET}")
-        print(" [1] Login to all package (Gán tuần tự Cookie 1 -> App 1, Cookie 2 -> App 2...)")
-        print(" [2] Login to select package (Chọn app cụ thể từ danh sách mục 3)")
+        print(f"\n{Colors.CYAN}--- Menu Login Cookie (Có {len(cookies)} cookies) ---{Colors.RESET}")
+        print(" [1] Login to all package (Gán tuần tự)")
+        print(" [2] Login to select package (Chọn app cụ thể rồi bấm 0 để lưu)")
         
-        choice = input(f"\n{Colors.MAGENTA}Chọn chức năng (1 hoặc 2): {Colors.RESET}").strip()
+        choice = input(f"\n{Colors.MAGENTA}Chọn (1 hoặc 2): {Colors.RESET}").strip()
 
         if choice == "1":
             pkgs = self.config.get("packages", [])
             if not pkgs:
-                print(f"{Colors.RED}[!] Danh sách package rỗng. Hãy quét package ở mục 3 trước.{Colors.RESET}")
+                print(f"{Colors.RED}[!] Chưa chọn package ở mục 3.{Colors.RESET}")
                 time.sleep(2)
                 return
 
             limit = min(len(pkgs), len(cookies))
-            print(f"{Colors.YELLOW}[*] Bắt đầu nạp Cookie cho {limit} packages...{Colors.RESET}")
+            print(f"{Colors.YELLOW}[*] Đang nạp {limit} cookies...{Colors.RESET}")
             for idx in range(limit):
                 pkg = pkgs[idx]
                 ck = cookies[idx]
@@ -191,13 +233,13 @@ class RobloxRejoinEngine:
                 print(f"{Colors.GREEN} [+] Đã gán Cookie #{idx+1} -> {pkg}{Colors.RESET}")
             
             self._save_config()
-            print(f"{Colors.GREEN}[+] Hoàn tất nạp Cookie cho toàn bộ app!{Colors.RESET}")
+            print(f"{Colors.GREEN}[+] Hoàn tất!{Colors.RESET}")
             time.sleep(2)
 
         elif choice == "2":
             pkgs = self.config.get("packages", [])
             if not pkgs:
-                print(f"{Colors.RED}[!] Danh sách package rỗng. Hãy quét package ở mục 3 trước.{Colors.RESET}")
+                print(f"{Colors.RED}[!] Chưa chọn package ở mục 3.{Colors.RESET}")
                 time.sleep(2)
                 return
 
@@ -205,20 +247,20 @@ class RobloxRejoinEngine:
             cookie_idx = 0
 
             while cookie_idx < len(cookies):
-                print(f"\n{Colors.CYAN}--- Chọn Package cho Cookie #{cookie_idx + 1} ---{Colors.RESET}")
+                print(f"\n{Colors.CYAN}--- Gán Cookie #{cookie_idx + 1} ---{Colors.RESET}")
                 for i, p in enumerate(pkgs, start=1):
                     status = f"{Colors.GREEN}(Đã chọn){Colors.RESET}" if p in selected_mapping else ""
                     print(f" [{i}] {p} {status}")
                 print(f" [0] {Colors.YELLOW}Dừng chọn và bắt đầu nạp Cookie{Colors.RESET}")
 
-                pick = input(f"{Colors.MAGENTA}Chọn số tương ứng với Package: {Colors.RESET}").strip()
+                pick = input(f"{Colors.MAGENTA}Chọn số thứ tự Package: {Colors.RESET}").strip()
                 if pick == "0":
                     break
 
                 if pick.isdigit() and 1 <= int(pick) <= len(pkgs):
                     target_pkg = pkgs[int(pick) - 1]
                     if target_pkg in selected_mapping:
-                        print(f"{Colors.YELLOW}[!] Package này đã được gán Cookie. Hãy chọn app khác.{Colors.RESET}")
+                        print(f"{Colors.YELLOW}[!] Package này đã được chọn. Chọn app khác.{Colors.RESET}")
                         continue
                     selected_mapping.append(target_pkg)
                     cookie_idx += 1
@@ -226,11 +268,11 @@ class RobloxRejoinEngine:
                     print(f"{Colors.RED}[!] Lựa chọn không hợp lệ.{Colors.RESET}")
 
             if not selected_mapping:
-                print(f"{Colors.YELLOW}[*] Không có package nào được chọn.{Colors.RESET}")
+                print(f"{Colors.YELLOW}[*] Hủy nạp Cookie.{Colors.RESET}")
                 time.sleep(1.5)
                 return
 
-            print(f"\n{Colors.YELLOW}[*] Đang thực thi nạp Cookie vào các app đã chọn...{Colors.RESET}")
+            print(f"\n{Colors.YELLOW}[*] Đang nạp Cookie vào các app đã chọn...{Colors.RESET}")
             for idx, pkg in enumerate(selected_mapping):
                 ck = cookies[idx]
                 self.device.inject_cookie_to_pkg(pkg, ck)
@@ -244,12 +286,12 @@ class RobloxRejoinEngine:
     def run_rejoin_loop(self, with_bypass: bool = False) -> None:
         pkgs = self.config.get("packages", [])
         if not pkgs:
-            print(f"{Colors.RED}[!] SieuVipPro: Chưa cấu hình packages. Hãy chọn mục 3 trước.{Colors.RESET}")
+            print(f"{Colors.RED}[!] Chưa có package nào. Hãy chọn mục 3 trước.{Colors.RESET}")
             time.sleep(2)
             return
 
         interval = self.config.get("check_ui_time", 180)
-        print(f"{Colors.GREEN}[+] [SieuVipPro] Auto Rejoin bắt đầu ({len(pkgs)} packages | Chu kỳ: {interval}s | Bypass={with_bypass}). Bấm Ctrl+C để dừng.{Colors.RESET}")
+        print(f"{Colors.GREEN}[+] SieuVipPro Auto Rejoin ({len(pkgs)} packages | Chu kỳ: {interval}s). Bấm Ctrl+C để dừng.{Colors.RESET}")
 
         try:
             while True:
@@ -258,14 +300,12 @@ class RobloxRejoinEngine:
                     place_id, job_id = self.parse_place_info(link)
                     
                     if not place_id:
-                        print(f"{Colors.YELLOW}[!] Package {pkg} chưa cấu hình Place ID.{Colors.RESET}")
                         continue
 
                     if with_bypass:
-                        fake_id = os.urandom(8).hex()
-                        self.device.set_android_id(fake_id)
+                        self.device.set_android_id(os.urandom(8).hex())
                     
-                    print(f"{Colors.CYAN}[SieuVipPro] Chạy -> {pkg} | Place: {place_id} | Instance: {job_id or 'Auto'}{Colors.RESET}")
+                    print(f"{Colors.CYAN}[SieuVipPro] Rejoin -> {pkg}{Colors.RESET}")
                     self.device.launch_place(pkg, place_id, job_id)
 
                 for remaining in range(interval, 0, -1):
@@ -274,46 +314,43 @@ class RobloxRejoinEngine:
                     time.sleep(1)
                 print()
         except KeyboardInterrupt:
-            print(f"\n{Colors.YELLOW}[!] Đã dừng Auto Rejoin.{Colors.RESET}")
+            print(f"\n{Colors.YELLOW}[!] Đã dừng.{Colors.RESET}")
             time.sleep(1.5)
 
     def list_packages(self) -> None:
         pkgs = self.config.get("packages", [])
-        print(f"\n{Colors.CYAN}--- Danh Sách Packages Đang Chọn ---{Colors.RESET}")
+        print(f"\n{Colors.CYAN}--- Packages Hiện Tại ---{Colors.RESET}")
         if not pkgs:
-            print("Chưa có package nào được chọn.")
+            print("Chưa có package.")
         for i, p in enumerate(pkgs, start=1):
-            link = self.config.get("server_links", {}).get(p, "Chưa gán link")
+            link = self.config.get("server_links", {}).get(p, "Không có link")
             print(f" {i}. {p} | Link: {link}")
         input(f"\n{Colors.MAGENTA}Bấm Enter để quay lại...{Colors.RESET}")
 
     def export_cookies(self) -> None:
-        print(f"\n{Colors.CYAN}--- SieuVipPro: Danh Sách Cookie ---{Colors.RESET}")
+        print(f"\n{Colors.CYAN}--- Danh Sách Cookie ---{Colors.RESET}")
         cookies = self.config.get("cookies", {})
         if not cookies:
-            print("Chưa có cookie nào được gán.")
+            print("Chưa có cookie nào.")
         for pkg, c in cookies.items():
-            print(f"[{pkg}]: {c[:30]}... (hidden)")
+            print(f"[{pkg}]: {c[:30]}... (ẩn)")
         input(f"\n{Colors.MAGENTA}Bấm Enter để quay lại...{Colors.RESET}")
 
     def download_apk(self) -> None:
         url = input(f"{Colors.MAGENTA}Nhập URL APK: {Colors.RESET}").strip()
         if not url:
             return
-        print(f"{Colors.CYAN}[*] Đang tải APK...{Colors.RESET}")
         cmd = f"curl -L \"{url}\" -o /sdcard/Download/roblox_update.apk"
         ok, _ = self.device.exec_cmd(cmd)
         if ok:
-            print(f"{Colors.GREEN}[+] Đang cài đặt APK...{Colors.RESET}")
             self.device.exec_cmd("pm install -r /sdcard/Download/roblox_update.apk")
         time.sleep(2)
 
     def change_android_id(self) -> None:
-        new_id = input(f"{Colors.MAGENTA}Nhập Android ID mới (hoặc bấm Enter để random): {Colors.RESET}").strip()
+        new_id = input(f"{Colors.MAGENTA}Nhập ID mới (hoặc Enter để random): {Colors.RESET}").strip()
         if not new_id:
             new_id = os.urandom(8).hex()
-        ok = self.device.set_android_id(new_id)
-        print(f"{Colors.GREEN}[+] Đã đổi Android ID: {new_id}{Colors.RESET}" if ok else f"{Colors.RED}[!] Thất bại.{Colors.RESET}")
+        self.device.set_android_id(new_id)
         time.sleep(1.5)
 
 class SieuVipProApp:
@@ -363,7 +400,7 @@ class SieuVipProApp:
             6: lambda: [self.engine.device.launch_place(p, "0") for p in self.engine.config.get("packages", [])],
             7: self.engine.login_via_cookie_menu,
             8: lambda: [self.engine.device.exec_cmd(f"pm clear {p}") for p in self.engine.config.get("packages", [])],
-            9: lambda: [print(f"{Colors.GREEN}[+] Đã đồng bộ cookie các bản clone.{Colors.RESET}"), time.sleep(1.5)],
+            9: lambda: [print(f"{Colors.GREEN}[+] Đã đồng bộ cookie.{Colors.RESET}"), time.sleep(1.5)],
             10: self.engine.export_cookies,
             11: self.engine.change_android_id,
             12: self.engine.download_apk,
