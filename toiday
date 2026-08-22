@@ -1,0 +1,51 @@
+#!/data/data/com.termux/files/usr/bin/bash
+
+GREEN='\033[0;32m'
+CYAN='\033[0;36m'
+RED='\033[0;31m'
+NC='\033[0m'
+
+# === CẤU HÌNH GITHUB CỦA BẠN ===
+GITHUB_USER="YOUR_GITHUB_USER"      # Thay username github
+REPO_NAME="YOUR_REPO"               # Thay tên repo github
+PYTHON_FILE="sieuvip.py"            # File code python
+# ===============================
+
+echo -e "${CYAN}[*] Đang khởi chạy gói cài đặt SieuVipPro...${NC}"
+
+# Cập nhật và cài các gói cần thiết
+pkg update -y && pkg install -y python curl tsu
+
+# Thư mục lưu mã nguồn ẩn
+INSTALL_DIR="/data/data/com.termux/files/home/.sieuvip_app"
+mkdir -p "$INSTALL_DIR"
+
+# Tải file Python về máy
+REPO_RAW_URL="https://raw.githubusercontent.com/${GITHUB_USER}/${REPO_NAME}/main"
+echo -e "${CYAN}[*] Đang tải mã nguồn SieuVipPro...${NC}"
+curl -sL "${REPO_RAW_URL}/${PYTHON_FILE}" -o "${INSTALL_DIR}/${PYTHON_FILE}"
+
+if [ ! -f "${INSTALL_DIR}/${PYTHON_FILE}" ]; then
+    echo -e "${RED}[!] Không thể tải file từ GitHub. Kiểm tra lại đường dẫn!${NC}"
+    return 1 2>/dev/null || exit 1
+fi
+
+# Tạo shortcut lệnh 'sieuvip' chạy với quyền root (su)
+BIN_PATH="/data/data/com.termux/files/usr/bin/sieuvip"
+cat << EOF > "$BIN_PATH"
+#!/data/data/com.termux/files/usr/bin/bash
+if [ "\$(id -u)" -ne 0 ]; then
+    sudo -E python ${INSTALL_DIR}/${PYTHON_FILE} 2>/dev/null || \
+    su -c "python ${INSTALL_DIR}/${PYTHON_FILE}"
+else
+    python ${INSTALL_DIR}/${PYTHON_FILE}
+fi
+EOF
+
+chmod +x "$BIN_PATH"
+
+echo -e "${GREEN}[+] Cài đặt hoàn tất!${NC}"
+echo -e "${CYAN}[*] Khởi động tool bằng lệnh: ${GREEN}sieuvip${NC}"
+
+# Khởi chạy ngay lập tức
+sieuvip
