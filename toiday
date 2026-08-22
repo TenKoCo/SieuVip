@@ -5,47 +5,49 @@ CYAN='\033[0;36m'
 RED='\033[0;31m'
 NC='\033[0m'
 
-# === CẤU HÌNH GITHUB CỦA BẠN ===
-GITHUB_USER="YOUR_GITHUB_USER"      # Thay username github
-REPO_NAME="YOUR_REPO"               # Thay tên repo github
-PYTHON_FILE="sieuvip.py"            # File code python
-# ===============================
+echo -e "${CYAN}[*] Đang khởi tạo môi trường SieuVipPro...${NC}"
 
-echo -e "${CYAN}[*] Đang khởi chạy gói cài đặt SieuVipPro...${NC}"
+# 1. Cấp quyền truy cập bộ nhớ & cài đặt Python
+termux-setup-storage 2>/dev/null
+pkg install -y python
 
-# Cập nhật và cài các gói cần thiết
-pkg update -y && pkg install -y python curl tsu
+# 2. Tải mã nguồn Hachimi.py bằng Python (Bypass hoàn toàn lỗi thư viện Curl)
+echo -e "${CYAN}[*] Đang tải mã nguồn Hachimi.py...${NC}"
+python -c '
+import urllib.request
+import ssl
 
-# Thư mục lưu mã nguồn ẩn
-INSTALL_DIR="/data/data/com.termux/files/home/.sieuvip_app"
-mkdir -p "$INSTALL_DIR"
+url = "https://raw.githubusercontent.com/TenKoCo/SieuVip/refs/heads/main/sieuvip.py"
+dest = "/sdcard/Download/Hachimi.py"
 
-# Tải file Python về máy
-REPO_RAW_URL="https://raw.githubusercontent.com/${GITHUB_USER}/${REPO_NAME}/main"
-echo -e "${CYAN}[*] Đang tải mã nguồn SieuVipPro...${NC}"
-curl -sL "${REPO_RAW_URL}/${PYTHON_FILE}" -o "${INSTALL_DIR}/${PYTHON_FILE}"
+ctx = ssl.create_default_context()
+ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE
 
-if [ ! -f "${INSTALL_DIR}/${PYTHON_FILE}" ]; then
-    echo -e "${RED}[!] Không thể tải file từ GitHub. Kiểm tra lại đường dẫn!${NC}"
+try:
+    with urllib.request.urlopen(url, context=ctx) as response, open(dest, "wb") as out_file:
+        out_file.write(response.read())
+    print("SUCCESS")
+except Exception as e:
+    print("ERROR:", e)
+' > /tmp/dl_status.log
+
+if ! grep -q "SUCCESS" /tmp/dl_status.log; then
+    echo -e "${RED}[!] Tải thất bại. Chi tiết lỗi:${NC}"
+    cat /tmp/dl_status.log
     return 1 2>/dev/null || exit 1
 fi
 
-# Tạo shortcut lệnh 'sieuvip' chạy với quyền root (su)
-BIN_PATH="/data/data/com.termux/files/usr/bin/sieuvip"
-cat << EOF > "$BIN_PATH"
+echo -e "${GREEN}[+] Đã lưu thành công vào /sdcard/Download/Hachimi.py${NC}"
+
+# 3. Tạo lệnh gõ tắt 'sieuvip' chạy trực tiếp với lệnh su
+cat << 'EOF' > /data/data/com.termux/files/usr/bin/sieuvip
 #!/data/data/com.termux/files/usr/bin/bash
-if [ "\$(id -u)" -ne 0 ]; then
-    sudo -E python ${INSTALL_DIR}/${PYTHON_FILE} 2>/dev/null || \
-    su -c "python ${INSTALL_DIR}/${PYTHON_FILE}"
-else
-    python ${INSTALL_DIR}/${PYTHON_FILE}
-fi
+su -c "export PATH=$PATH:/data/data/com.termux/files/usr/bin && export TERM=xterm-256color && cd /sdcard/Download && python Hachimi.py"
 EOF
 
-chmod +x "$BIN_PATH"
+chmod +x /data/data/com.termux/files/usr/bin/sieuvip
 
-echo -e "${GREEN}[+] Cài đặt hoàn tất!${NC}"
-echo -e "${CYAN}[*] Khởi động tool bằng lệnh: ${GREEN}sieuvip${NC}"
-
-# Khởi chạy ngay lập tức
-sieuvip
+# 4. Kích hoạt trực tiếp bằng lệnh su
+echo -e "${GREEN}[+] Đang khởi chạy tool với quyền Root (su)...${NC}"
+su -c "export PATH=$PATH:/data/data/com.termux/files/usr/bin && export TERM=xterm-256color && cd /sdcard/Download && python Hachimi.py"
