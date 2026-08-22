@@ -1,44 +1,34 @@
 #!/data/data/com.termux/files/usr/bin/bash
 
-# 1. Tự động fix lỗi cấp quyền bộ nhớ (Force reset storage link)
-if [ -L "$HOME/storage" ] || [ -d "$HOME/storage" ]; then
-    rm -rf "$HOME/storage"
-fi
+# Reset quyền
+if [ -L "$HOME/storage" ] || [ -d "$HOME/storage" ]; then rm -rf "$HOME/storage"; fi
 termux-setup-storage 2>/dev/null
 
-# 2. Ép cập nhật không chờ xác nhận (Force Yes Pipeline)
+# Cài môi trường
 yes | pkg update
 yes | pkg upgrade
-
-# 3. Thiết lập biến môi trường CFLAGS chống crash khi cài thư viện Python
 export CFLAGS="-Wno-error=implicit-function-declaration"
-
-# 4. Cài đặt Python và các công cụ
 yes | pkg install python curl wget tsu
 
-# 5. Đảm bảo thư mục và file cấu hình tồn tại
 mkdir -p /sdcard/Download
 if [ ! -f /sdcard/Download/cookie.txt ]; then
-    echo "# Dán mỗi dòng 1 mã Cookie .ROBLOSECURITY vào đây" > /sdcard/Download/cookie.txt
+    echo "# Dán cookie vào đây" > /sdcard/Download/cookie.txt
 fi
 
-# 6. Tải mã nguồn SieuVipPro bằng wget (ổn định hơn curl trên một số máy)
-echo "[*] Đang nạp mã nguồn SieuVipPro..."
-wget -qO /sdcard/Download/Hachimi.py "https://raw.githubusercontent.com/TenKoCo/SieuVip/refs/heads/main/sieuvip.py"
+# TẢI MÃ NGUỒN VỚI CACHE-BUSTING (Ép tải code mới nhất)
+echo "[*] Đang cập nhật mã nguồn SieuVipPro mới nhất..."
+wget -qO /sdcard/Download/Hachimi.py "https://raw.githubusercontent.com/TenKoCo/SieuVip/refs/heads/main/sieuvip.py?v=$RANDOM"
 
 if [ ! -s /sdcard/Download/Hachimi.py ]; then
-    echo "[!] Tải thất bại. Hãy kiểm tra lại kết nối mạng hoặc file trên GitHub!"
+    echo "[!] Tải thất bại!"
     return 1 2>/dev/null || exit 1
 fi
 
-echo "[+] Cập nhật thành công!"
-
-# 7. Tạo shortcut 'sieuvip'
 cat << 'EOF' > /data/data/com.termux/files/usr/bin/sieuvip
 #!/data/data/com.termux/files/usr/bin/bash
 su -c "export PATH=$PATH:/data/data/com.termux/files/usr/bin && export TERM=xterm-256color && cd /sdcard/Download && python Hachimi.py"
 EOF
 chmod +x /data/data/com.termux/files/usr/bin/sieuvip
 
-# 8. Kích hoạt tool
+# Chạy Tool
 su -c "export PATH=$PATH:/data/data/com.termux/files/usr/bin && export TERM=xterm-256color && cd /sdcard/Download && python Hachimi.py"
