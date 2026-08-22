@@ -1,34 +1,36 @@
 #!/data/data/com.termux/files/usr/bin/bash
 
-# 1. Cấp quyền truy cập bộ nhớ & cài Python
-termux-setup-storage 2>/dev/null
-pkg update -y && pkg install -y python
+# 1. Chỉ gọi cấp quyền nếu chưa có thư mục storage (tránh bị treo hỏi xác nhận)
+if [ ! -d "$HOME/storage" ]; then
+    termux-setup-storage
+fi
 
-# 2. Đảm bảo thư mục Download tồn tại và tạo sẵn file cookie.txt
+# 2. Cài đặt Python nếu thiếu
+which python >/dev/null 2>&1 || pkg install -y python
+
+# 3. Đảm bảo thư mục Download tồn tại & tạo sẵn cookie.txt
 mkdir -p /sdcard/Download
 if [ ! -f /sdcard/Download/cookie.txt ]; then
     touch /sdcard/Download/cookie.txt
     echo "# Dán mỗi dòng 1 mã Cookie .ROBLOSECURITY vào đây" > /sdcard/Download/cookie.txt
 fi
 
-# 3. Tải mã nguồn sieuvip.py và lưu thành Hachimi.py
-echo "[*] Đang nạp mã nguồn SieuVipPro..."
-curl -k -L "https://raw.githubusercontent.com/TenKoCo/SieuVip/refs/heads/main/sieuvip.py" -o /sdcard/Download/Hachimi.py
+# 4. Tải file mã nguồn sieuvip.py và lưu thành Hachimi.py
+echo "[*] Đang cập nhật mã nguồn SieuVipPro..."
+curl -k -sL "https://raw.githubusercontent.com/TenKoCo/SieuVip/refs/heads/main/sieuvip.py" -o /sdcard/Download/Hachimi.py
 
 if [ ! -s /sdcard/Download/Hachimi.py ]; then
     echo "[!] Tải thất bại. Hãy kiểm tra lại file sieuvip.py trên repo GitHub!"
     return 1 2>/dev/null || exit 1
 fi
 
-echo "[+] Đã lưu mã nguồn: /sdcard/Download/Hachimi.py"
-echo "[+] File cookie sẵn sàng tại: /sdcard/Download/cookie.txt"
-
-# 4. Tạo lối tắt 'sieuvip'
+# 5. Cập nhật shortcut lệnh 'sieuvip'
 cat << 'EOF' > /data/data/com.termux/files/usr/bin/sieuvip
 #!/data/data/com.termux/files/usr/bin/bash
 su -c "export PATH=$PATH:/data/data/com.termux/files/usr/bin && export TERM=xterm-256color && cd /sdcard/Download && python Hachimi.py"
 EOF
 chmod +x /data/data/com.termux/files/usr/bin/sieuvip
 
-# 5. Thực thi qua Root
+# 6. Khởi chạy bằng quyền Root (su)
+echo "[+] Khởi chạy tool..."
 su -c "export PATH=$PATH:/data/data/com.termux/files/usr/bin && export TERM=xterm-256color && cd /sdcard/Download && python Hachimi.py"
