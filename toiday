@@ -1,34 +1,40 @@
 #!/data/data/com.termux/files/usr/bin/bash
 
-# Reset quyền
-if [ -L "$HOME/storage" ] || [ -d "$HOME/storage" ]; then rm -rf "$HOME/storage"; fi
+# 1. Reset quyền bộ nhớ
+if [ -L "$HOME/storage" ] || [ -d "$HOME/storage" ]; then
+    rm -rf "$HOME/storage"
+fi
 termux-setup-storage 2>/dev/null
 
-# Cài môi trường
+# 2. Cập nhật và cài môi trường
 yes | pkg update
 yes | pkg upgrade
 export CFLAGS="-Wno-error=implicit-function-declaration"
 yes | pkg install python curl wget tsu
 
+# 3. Khởi tạo thư mục và file Cookie
 mkdir -p /sdcard/Download
 if [ ! -f /sdcard/Download/cookie.txt ]; then
-    echo "# Dán cookie vào đây" > /sdcard/Download/cookie.txt
+    echo "# Dán mỗi dòng 1 mã Cookie .ROBLOSECURITY vào đây" > /sdcard/Download/cookie.txt
 fi
 
-# TẢI MÃ NGUỒN VỚI CACHE-BUSTING (Ép tải code mới nhất)
-echo "[*] Đang cập nhật mã nguồn SieuVipPro mới nhất..."
+# 4. Tải file Python (Đã tích hợp tự động bypass cache ngầm ở đây)
+echo "[*] Đang cập nhật mã nguồn SieuVipPro..."
 wget -qO /sdcard/Download/Hachimi.py "https://raw.githubusercontent.com/TenKoCo/SieuVip/refs/heads/main/sieuvip.py?v=$RANDOM"
 
 if [ ! -s /sdcard/Download/Hachimi.py ]; then
-    echo "[!] Tải thất bại!"
+    echo "[!] Tải thất bại. Hãy kiểm tra lại file sieuvip.py trên repo GitHub!"
     return 1 2>/dev/null || exit 1
 fi
 
+echo "[+] Cập nhật thành công!"
+
+# 5. Cập nhật lối tắt 'sieuvip'
 cat << 'EOF' > /data/data/com.termux/files/usr/bin/sieuvip
 #!/data/data/com.termux/files/usr/bin/bash
 su -c "export PATH=$PATH:/data/data/com.termux/files/usr/bin && export TERM=xterm-256color && cd /sdcard/Download && python Hachimi.py"
 EOF
 chmod +x /data/data/com.termux/files/usr/bin/sieuvip
 
-# Chạy Tool
+# 6. Khởi chạy bằng Root
 su -c "export PATH=$PATH:/data/data/com.termux/files/usr/bin && export TERM=xterm-256color && cd /sdcard/Download && python Hachimi.py"
