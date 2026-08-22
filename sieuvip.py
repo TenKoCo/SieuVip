@@ -53,32 +53,48 @@ class DeviceController:
         cls.exec_cmd(f"am force-stop {pkg}")
 
     @classmethod
-    def launch_place(cls, pkg: str, place_id: str, job_id: Optional[str] = None, link_code: Optional[str] = None, freeform: bool = False, bounds: Optional[str] = None) -> None:
+    def open_lobby(cls, pkg: str) -> None:
+        """ĐỢT 1: Đóng app ngầm và mở vào sảnh an toàn"""
         cls.kill_package(pkg)
         time.sleep(1)
+        ok, out = cls.exec_cmd(f"am start -n {pkg}/com.roblox.client.ActivityProtocolLaunch")
+        if not ok or "Error" in out or "Exception" in out:
+            # Fallback nếu Activity chính không phản hồi
+            cls.exec_cmd(f"monkey -p {pkg} -c android.intent.category.LAUNCHER 1 > /dev/null 2>&1")
+
+    @classmethod
+    def launch_place(cls, pkg: str, place_id: str, job_id: Optional[str] = None, link_code: Optional[str] = None, freeform: bool = False, bounds: Optional[str] = None) -> None:
+        """ĐỢT 2: Đóng app và Join Game (Kèm thuật toán Fallback chống lỗi OS)"""
+        cls.kill_package(pkg)
+        time.sleep(1.5)
         
         intent_url = f"roblox://experiences/start?placeId={place_id}"
         if job_id: intent_url += f"&gameInstanceId={job_id}"
         elif link_code: intent_url += f"&linkCode={link_code}"
             
-        cmd_primary = f"am start"
+        cmd_base = f"-a android.intent.action.VIEW -d '{intent_url}'"
+        cmd_normal = f"am start -n {pkg}/com.roblox.client.ActivityProtocolLaunch {cmd_base}"
+        cmd_fallback = f"am start -p {pkg} {cmd_base}"
+
         if freeform:
             cls.exec_cmd("settings put global enable_freeform_support 1")
             cls.exec_cmd("settings put global force_resizable_activities 1")
-            cmd_primary += " --windowingMode 5"
-            if bounds:
-                cmd_primary += f" --bounds {bounds}"
+            ff_flags = " --windowingMode 5"
+            if bounds: ff_flags += f" --bounds {bounds}"
             
-        cmd_primary += f" -n {pkg}/com.roblox.client.ActivityProtocolLaunch -a android.intent.action.VIEW -d '{intent_url}'"
-        
-        ok, out = cls.exec_cmd(cmd_primary)
-        if not ok or "Error" in out or "Exception" in out:
-            cmd_fallback = f"am start -p {pkg} -a android.intent.action.VIEW -d '{intent_url}'"
-            if freeform:
-                cmd_fallback = f"am start --windowingMode 5"
-                if bounds: cmd_fallback += f" --bounds {bounds}"
-                cmd_fallback += f" -p {pkg} -a android.intent.action.VIEW -d '{intent_url}'"
-            cls.exec_cmd(cmd_fallback)
+            # Thử mở bằng Config 13
+            ok, out = cls.exec_cmd(f"am start {ff_flags} -n {pkg}/com.roblox.client.ActivityProtocolLaunch {cmd_base}")
+            if not ok or "Error" in out or "Exception" in out:
+                # Thử lại Config 13 với cú pháp khác
+                ok2, out2 = cls.exec_cmd(f"am start {ff_flags} -p {pkg} {cmd_base}")
+                if not ok2 or "Error" in out2 or "Exception" in out2:
+                    # HỆ THỐNG KHÔNG HỖ TRỢ BỘ CẮT SIZE -> Tự động chuyển về Full màn hình
+                    cls.exec_cmd(cmd_normal)
+        else:
+            # Chạy bình thường nếu không bật Config 13
+            ok, out = cls.exec_cmd(cmd_normal)
+            if not ok or "Error" in out or "Exception" in out:
+                cls.exec_cmd(cmd_fallback)
 
     @classmethod
     def set_android_id(cls, new_id: str) -> bool:
@@ -223,7 +239,7 @@ class RobloxRejoinEngine:
         return w, h
 
     def live_dashboard_thread(self):
-        """Thread chạy ngầm để render UI liên tục mỗi 1 giây"""
+        """Render UI 1 giây / lần - Bám sát tiến độ hệ thống"""
         while self.ui_running:
             cpu, ram = self.get_system_stats()
             os.system("cls" if os.name == "nt" else "clear")
@@ -252,17 +268,17 @@ class RobloxRejoinEngine:
             time.sleep(1.5)
             return
 
-        # Hỏi thời gian lặp lại trước khi chạy
+        # 1. NHẬP THỜI GIAN LẶP LẠI (0 = chạy 1 lần rồi treo màn)
         print(f"\n{Colors.CYAN}--- Cài đặt thời gian chạy ---{Colors.RESET}")
         try:
-            raw_time = input(f"{Colors.MAGENTA}Nhập thời gian lặp lại để đóng tab (phút) [Nhập 0 để không đóng]: {Colors.RESET}").strip()
+            raw_time = input(f"{Colors.MAGENTA}Nhập thời gian chờ để lặp lại (phút) [Nhập 0 để KHÔNG đóng tab]: {Colors.RESET}").strip()
             interval_seconds = int(float(raw_time) * 60) if raw_time else 0
         except ValueError:
             interval_seconds = 0
 
         print(f"{Colors.YELLOW}[*] Đang khởi tạo luồng & trích xuất Username...{Colors.RESET}")
         
-        self.status_map = {p: "Đang nạp..." for p in pkgs}
+        self.status_map = {p: "Chuẩn bị..." for p in pkgs}
         self.username_map = {}
         for p in pkgs:
             cookie = self.config.get("cookies", {}).get(p)
@@ -274,27 +290,15 @@ class RobloxRejoinEngine:
 
         try:
             while True:
-                # --- KIỂM TRA CHẠY NỀN (BACKGROUND CHECK) ---
-                self.global_status = "Đang kiểm tra tiến trình chạy ngầm..."
+                # --- ĐỢT 1: KIỂM TRA CHẠY NỀN & MỞ VÀO SẢNH ---
+                self.global_status = "Đang chạy Đợt 1: Quét ngầm và Khởi động sảnh..."
                 for pkg in pkgs:
-                    self.status_map[pkg] = "Kiểm tra chạy nền..."
-                    ok, out = self.device.exec_cmd(f"pidof {pkg}")
-                    if ok and out.strip():
-                        self.status_map[pkg] = "Phát hiện chạy ngầm -> Đóng"
-                        self.device.kill_package(pkg)
-                        time.sleep(1)
+                    self.status_map[pkg] = "Đợt 1: Đóng app & Mở sảnh..."
+                    self.device.open_lobby(pkg) # Hàm này đã bao gồm ép đóng (kill nền) rồi mới mở
+                    self.status_map[pkg] = "Đợt 1: Đã vào sảnh"
+                    time.sleep(3) # Cho app 3 giây để load xong giao diện sảnh
 
-                # --- ĐỢT 1: Lướt qua toàn bộ app (Force Stop -> Mở lại sảnh) ---
-                self.global_status = "Đang chạy Đợt 1: Khởi động app vào sảnh..."
-                for pkg in pkgs:
-                    self.status_map[pkg] = "Đợt 1: Force Stop..."
-                    self.device.kill_package(pkg)
-                    time.sleep(1.5)
-                    self.status_map[pkg] = "Đợt 1: Mở sảnh..."
-                    self.device.exec_cmd(f"monkey -p {pkg} -c android.intent.category.LAUNCHER 1 > /dev/null 2>&1")
-                    time.sleep(2)
-
-                # --- Lấy cấu hình Config 13 để áp dụng cho Đợt 2 ---
+                # --- LẤY CẤU HÌNH CONFIG 13 ---
                 auto_rs = self.config.get("auto_resize", False)
                 auto_ar = self.config.get("auto_arrange", False)
                 freeform_enabled = auto_rs or auto_ar
@@ -310,34 +314,29 @@ class RobloxRejoinEngine:
                         left, top = (i % cols) * sw, (i // cols) * sh
                         grid_bounds.append(f"{left},{top},{left+sw},{top+sh}")
 
-                # --- ĐỢT 2: Đóng toàn bộ app -> Mở lại + Config 13 + Join Game ID ---
-                self.global_status = "Đang chạy Đợt 2: Join Game & Chỉnh Size..."
+                # --- ĐỢT 2: ĐÓNG TOÀN BỘ -> JOIN GAME THEO LINK ---
+                self.global_status = "Đang chạy Đợt 2: Join Game & Áp dụng Config 13..."
                 for i, pkg in enumerate(pkgs):
-                    self.status_map[pkg] = "Đợt 2: Force Stop..."
-                    self.device.kill_package(pkg)
-                    time.sleep(1.5)
-                    
+                    self.status_map[pkg] = "Đợt 2: Đang Join Game..."
                     link = self.config.get("server_links", {}).get(pkg, "")
                     place_id, job_id, link_code = self.parse_place_info(link)
                     
                     if not place_id:
-                        self.status_map[pkg] = "Lỗi: Không có Place ID"
+                        self.status_map[pkg] = "Lỗi: Link/ID trống"
                         continue
 
                     if with_bypass: self.device.set_android_id(os.urandom(8).hex())
                     
-                    self.status_map[pkg] = "Đợt 2: Đang Join..."
                     b_str = grid_bounds[i] if auto_ar else ("0,0,600,800" if auto_rs else None)
-                    
                     self.device.launch_place(pkg, place_id, job_id, link_code, freeform=freeform_enabled, bounds=b_str)
-                    time.sleep(3)
+                    time.sleep(4)
                     self.status_map[pkg] = "Joined"
 
-                # --- XỬ LÝ THỜI GIAN LẶP (0 = Treo nguyên, >0 = Đếm lùi) ---
+                # --- XỬ LÝ ĐẾM LÙI ---
                 if interval_seconds <= 0:
-                    self.global_status = "Hoàn tất! Các tab đang được giữ nguyên (Không tự động đóng)."
+                    self.global_status = "Hoàn tất! Các tab đang được giữ nguyên (Không lặp lại)."
                     while True:
-                        time.sleep(1) # Treo UI vĩnh viễn ở trạng thái hiển thị
+                        time.sleep(1) # Treo UI cho user xem
                 else:
                     for remaining in range(interval_seconds, 0, -1):
                         mins = remaining // 60
@@ -346,7 +345,7 @@ class RobloxRejoinEngine:
                         time.sleep(1)
 
         except KeyboardInterrupt:
-            # Bắt sự kiện thoát Ctrl+C
+            # Thoát an toàn
             pass
         finally:
             self.ui_running = False
