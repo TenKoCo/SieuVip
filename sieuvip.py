@@ -22,24 +22,28 @@ class Colors:
 class DeviceController:
     @staticmethod
     def exec_cmd(command: str) -> Tuple[bool, str]:
-        """SỬA LỖI CHÍNH Ở ĐÂY: Trả lại quyền 'su -c' và chống treo bằng DEVNULL"""
+        """Giải pháp tối thượng: Ghi lệnh ra file sh để lách 100% lỗi PATH và Quoting của giả lập"""
         try:
-            res = subprocess.run(
-                ["su", "-c", command], 
-                capture_output=True, 
-                text=True, 
-                stdin=subprocess.DEVNULL, # Cực kỳ quan trọng: Chống treo (hang) process ngầm
-                timeout=15
-            )
-            if res.returncode == 0:
-                return True, res.stdout.strip()
-            return False, res.stderr.strip()
-        except Exception:
-            try:
-                res = subprocess.run(command, shell=True, capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=15)
-                return (res.returncode == 0), res.stdout.strip() if res.returncode == 0 else res.stderr.strip()
-            except Exception as e:
-                return False, str(e)
+            script_path = "/sdcard/Download/sv_cmd.sh"
+            with open(script_path, "w", encoding="utf-8") as f:
+                f.write("#!/system/bin/sh\n")
+                f.write("export PATH=/sbin:/system/sbin:/system/bin:/system/xbin:/data/data/com.termux/files/usr/bin:$PATH\n")
+                f.write(command + "\n")
+            
+            # Chạy file bash trực tiếp (Python đã có quyền root từ toiday)
+            res = subprocess.run(["sh", script_path], capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=15)
+            
+            # Gộp cả Output và Error để bắt lỗi
+            output = (res.stdout + "\n" + res.stderr).strip()
+            
+            # Nếu giả lập tước quyền, ép dùng su -c chạy file
+            if res.returncode != 0 and "Permission denied" in output:
+                res = subprocess.run(["su", "-c", f"sh {script_path}"], capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=15)
+                output = (res.stdout + "\n" + res.stderr).strip()
+                
+            return (res.returncode == 0), output
+        except Exception as e:
+            return False, str(e)
 
     @classmethod
     def get_all_packages(cls) -> List[str]:
@@ -65,14 +69,18 @@ class DeviceController:
 
     @classmethod
     def open_lobby(cls, pkg: str) -> None:
-        """ĐỢT 1: Đóng app ngầm và dùng Monkey mở thẳng vào sảnh (Cách an toàn nhất Android)"""
+        """ĐỢT 1: Buộc đóng app và Mở sảnh"""
         cls.kill_package(pkg)
         time.sleep(1.5)
-        cls.exec_cmd(f"monkey -p {pkg} -c android.intent.category.LAUNCHER 1")
+        # Cách 1: Monkey
+        ok, out = cls.exec_cmd(f"monkey -p {pkg} -c android.intent.category.LAUNCHER 1")
+        if not ok or "Error" in out or "Exception" in out or "aborted" in out.lower():
+            # Cách 2: Dùng am start gọi Main Launcher
+            cls.exec_cmd(f"am start -p {pkg}")
 
     @classmethod
     def launch_place(cls, pkg: str, place_id: str, job_id: Optional[str] = None, link_code: Optional[str] = None, freeform: bool = False, bounds: Optional[str] = None) -> None:
-        """ĐỢT 2: Join Game có ép Size (Config 13)"""
+        """ĐỢT 2: Join Game an toàn cho cả Clone và App gốc"""
         cls.kill_package(pkg)
         time.sleep(1.5)
         
@@ -81,8 +89,10 @@ class DeviceController:
         elif link_code: intent_url += f"&linkCode={link_code}"
             
         cmd_base = f"-a android.intent.action.VIEW -d '{intent_url}'"
-        cmd_normal = f"am start -n {pkg}/com.roblox.client.ActivityProtocolLaunch {cmd_base}"
-        cmd_fallback = f"am start -p {pkg} {cmd_base}"
+        
+        # Ưu tiên gọi bằng -p (Package Name) thay vì gọi -n Component (Tránh lỗi clone app đổi tên Component)
+        cmd_primary = f"am start -p {pkg} {cmd_base}"
+        cmd_fallback = f"am start -n {pkg}/com.roblox.client.ActivityProtocolLaunch {cmd_base}"
 
         if freeform:
             cls.exec_cmd("settings put global enable_freeform_support 1")
@@ -90,13 +100,16 @@ class DeviceController:
             ff_flags = "--windowingMode 5"
             if bounds: ff_flags += f" --bounds {bounds}"
             
-            ok, out = cls.exec_cmd(f"am start {ff_flags} -n {pkg}/com.roblox.client.ActivityProtocolLaunch {cmd_base}")
+            # Thử Config 13
+            ok, out = cls.exec_cmd(f"am start {ff_flags} -p {pkg} {cmd_base}")
             if not ok or "Error" in out or "Exception" in out:
-                ok2, out2 = cls.exec_cmd(f"am start {ff_flags} -p {pkg} {cmd_base}")
+                # Nếu hệ thống từ chối Size, fallback về Full màn hình
+                ok2, out2 = cls.exec_cmd(cmd_primary)
                 if not ok2 or "Error" in out2 or "Exception" in out2:
-                    cls.exec_cmd(cmd_normal)
+                    cls.exec_cmd(cmd_fallback)
         else:
-            ok, out = cls.exec_cmd(cmd_normal)
+            # Không dùng Config 13
+            ok, out = cls.exec_cmd(cmd_primary)
             if not ok or "Error" in out or "Exception" in out:
                 cls.exec_cmd(cmd_fallback)
 
@@ -243,6 +256,7 @@ class RobloxRejoinEngine:
         return w, h
 
     def live_dashboard_thread(self):
+        """Render UI 1 giây / lần"""
         while self.ui_running:
             cpu, ram = self.get_system_stats()
             os.system("cls" if os.name == "nt" else "clear")
@@ -317,7 +331,7 @@ class RobloxRejoinEngine:
                         grid_bounds.append(f"{left},{top},{left+sw},{top+sh}")
 
                 # --- ĐỢT 2: JOIN GAME & ÉP KÍCH THƯỚC ---
-                self.global_status = "Đang chạy Đợt 2: Join Game & Chỉnh Config 13..."
+                self.global_status = "Đang chạy Đợt 2: Join Game & Áp dụng Config..."
                 for i, pkg in enumerate(pkgs):
                     self.status_map[pkg] = "Đợt 2: Đang Join Game..."
                     link = self.config.get("server_links", {}).get(pkg, "")
