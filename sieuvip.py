@@ -22,7 +22,6 @@ class Colors:
 class DeviceController:
     @staticmethod
     def exec_cmd(command: str) -> Tuple[bool, str]:
-        """Giải pháp tối thượng: Ghi lệnh ra file sh để lách 100% lỗi PATH và Quoting của giả lập"""
         try:
             script_path = "/sdcard/Download/sv_cmd.sh"
             with open(script_path, "w", encoding="utf-8") as f:
@@ -30,13 +29,9 @@ class DeviceController:
                 f.write("export PATH=/sbin:/system/sbin:/system/bin:/system/xbin:/data/data/com.termux/files/usr/bin:$PATH\n")
                 f.write(command + "\n")
             
-            # Chạy file bash trực tiếp (Python đã có quyền root từ toiday)
             res = subprocess.run(["sh", script_path], capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=15)
-            
-            # Gộp cả Output và Error để bắt lỗi
             output = (res.stdout + "\n" + res.stderr).strip()
             
-            # Nếu giả lập tước quyền, ép dùng su -c chạy file
             if res.returncode != 0 and "Permission denied" in output:
                 res = subprocess.run(["su", "-c", f"sh {script_path}"], capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=15)
                 output = (res.stdout + "\n" + res.stderr).strip()
@@ -69,28 +64,24 @@ class DeviceController:
 
     @classmethod
     def open_lobby(cls, pkg: str) -> None:
-        """ĐỢT 1: Buộc đóng app và Mở sảnh"""
+        """ĐỢT 1: Đóng app và Mở sảnh (Warm-up)"""
         cls.kill_package(pkg)
         time.sleep(1.5)
-        # Cách 1: Monkey
         ok, out = cls.exec_cmd(f"monkey -p {pkg} -c android.intent.category.LAUNCHER 1")
         if not ok or "Error" in out or "Exception" in out or "aborted" in out.lower():
-            # Cách 2: Dùng am start gọi Main Launcher
             cls.exec_cmd(f"am start -p {pkg}")
 
     @classmethod
-    def launch_place(cls, pkg: str, place_id: str, job_id: Optional[str] = None, link_code: Optional[str] = None, freeform: bool = False, bounds: Optional[str] = None) -> None:
-        """ĐỢT 2: Join Game an toàn cho cả Clone và App gốc"""
-        cls.kill_package(pkg)
-        time.sleep(1.5)
+    def launch_place(cls, pkg: str, place_id: str, job_id: Optional[str] = None, link_code: Optional[str] = None, share_code: Optional[str] = None, freeform: bool = False, bounds: Optional[str] = None) -> bool:
+        """ĐỢT 2: SỬA LỖI - Không Force Stop lại nữa, chỉ bắn Deep Link vào app đã mở sẵn ở nền."""
         
+        # Tạo URL Intent an toàn
         intent_url = f"roblox://experiences/start?placeId={place_id}"
         if job_id: intent_url += f"&gameInstanceId={job_id}"
         elif link_code: intent_url += f"&linkCode={link_code}"
+        elif share_code: intent_url += f"&code={share_code}"
             
         cmd_base = f"-a android.intent.action.VIEW -d '{intent_url}'"
-        
-        # Ưu tiên gọi bằng -p (Package Name) thay vì gọi -n Component (Tránh lỗi clone app đổi tên Component)
         cmd_primary = f"am start -p {pkg} {cmd_base}"
         cmd_fallback = f"am start -n {pkg}/com.roblox.client.ActivityProtocolLaunch {cmd_base}"
 
@@ -100,18 +91,18 @@ class DeviceController:
             ff_flags = "--windowingMode 5"
             if bounds: ff_flags += f" --bounds {bounds}"
             
-            # Thử Config 13
             ok, out = cls.exec_cmd(f"am start {ff_flags} -p {pkg} {cmd_base}")
             if not ok or "Error" in out or "Exception" in out:
-                # Nếu hệ thống từ chối Size, fallback về Full màn hình
                 ok2, out2 = cls.exec_cmd(cmd_primary)
                 if not ok2 or "Error" in out2 or "Exception" in out2:
-                    cls.exec_cmd(cmd_fallback)
+                    return cls.exec_cmd(cmd_fallback)[0]
+                return True
+            return True
         else:
-            # Không dùng Config 13
             ok, out = cls.exec_cmd(cmd_primary)
             if not ok or "Error" in out or "Exception" in out:
-                cls.exec_cmd(cmd_fallback)
+                return cls.exec_cmd(cmd_fallback)[0]
+            return True
 
     @classmethod
     def set_android_id(cls, new_id: str) -> bool:
@@ -199,7 +190,8 @@ class RobloxRejoinEngine:
         except Exception:
             return "Unknown"
 
-    def parse_place_info(self, raw_input: str) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+    def parse_place_info(self, raw_input: str) -> Tuple[Optional[str], Optional[str], Optional[str], Optional[str]]:
+        """SỬA LỖI: Thêm Regex bắt Share Code dạng mới"""
         place_match = re.search(r"games/(\d+)", raw_input)
         place_id = place_match.group(1) if place_match else None
         if not place_id and raw_input.isdigit(): place_id = raw_input
@@ -209,8 +201,11 @@ class RobloxRejoinEngine:
         
         link_code_match = re.search(r"privateServerLinkCode=([a-zA-Z0-9\-_]+)", raw_input)
         link_code = link_code_match.group(1) if link_code_match else None
+        
+        share_code_match = re.search(r"share\?code=([a-zA-Z0-9\-_]+)", raw_input)
+        share_code = share_code_match.group(1) if share_code_match else None
 
-        return place_id, job_id, link_code
+        return place_id, job_id, link_code, share_code
 
     def get_system_stats(self) -> Tuple[str, str]:
         ram_usage = "N/A"
@@ -256,13 +251,12 @@ class RobloxRejoinEngine:
         return w, h
 
     def live_dashboard_thread(self):
-        """Render UI 1 giây / lần"""
         while self.ui_running:
             cpu, ram = self.get_system_stats()
             os.system("cls" if os.name == "nt" else "clear")
             print(f"\n{' '*20}{Colors.CYAN}CPU: {cpu} | RAM: {ram}{Colors.RESET}\n")
             
-            w_pkg, w_usr, w_stt = 22, 16, 30
+            w_pkg, w_usr, w_stt = 22, 16, 32 # Tăng size cột Status để ghi rõ lỗi
             
             print(f"┌{'─' * w_pkg}┬{'─' * w_usr}┬{'─' * w_stt}┐")
             print(f"│ {Colors.MAGENTA}{'Package':<{w_pkg-1}}{Colors.RESET}│ {Colors.MAGENTA}{'Username':<{w_usr-1}}{Colors.RESET}│ {Colors.MAGENTA}{'Status':<{w_stt-1}}{Colors.RESET}│")
@@ -271,7 +265,10 @@ class RobloxRejoinEngine:
             for pkg in self.config.get("packages", []):
                 usr = self.username_map.get(pkg, "Unknown")
                 stt = self.status_map.get(pkg, "Waiting...")
-                print(f"│ {Colors.CYAN}{pkg:<{w_pkg-1}}{Colors.RESET}│ {Colors.GREEN}{usr:<{w_usr-1}}{Colors.RESET}│ {Colors.GREEN}{stt:<{w_stt-1}}{Colors.RESET}│")
+                
+                # Sửa màu tuỳ trạng thái báo lỗi cho trực quan
+                col_stt = Colors.RED if "Lỗi" in stt or "Failed" in stt else Colors.GREEN
+                print(f"│ {Colors.CYAN}{pkg:<{w_pkg-1}}{Colors.RESET}│ {Colors.GREEN}{usr:<{w_usr-1}}{Colors.RESET}│ {col_stt}{stt:<{w_stt-1}}{Colors.RESET}│")
                 
             print(f"└{'─' * w_pkg}┴{'─' * w_usr}┴{'─' * w_stt}┘")
             print(f"\n{Colors.YELLOW}[*] {self.global_status}{Colors.RESET}")
@@ -306,15 +303,14 @@ class RobloxRejoinEngine:
 
         try:
             while True:
-                # --- ĐỢT 1: ĐÓNG VÀ MỞ SẢNH ---
+                # --- ĐỢT 1: ĐÓNG VÀ MỞ SẢNH (Warm-up) ---
                 self.global_status = "Đang chạy Đợt 1: Khởi động sảnh..."
                 for pkg in pkgs:
                     self.status_map[pkg] = "Đợt 1: Khởi động sảnh..."
                     self.device.open_lobby(pkg)
                     time.sleep(4)
-                    self.status_map[pkg] = "Đợt 1: Xong"
+                    self.status_map[pkg] = "Đợt 1: Sẵn sàng (Nền)"
 
-                # LẤY CẤU HÌNH CONFIG 13
                 auto_rs = self.config.get("auto_resize", False)
                 auto_ar = self.config.get("auto_arrange", False)
                 freeform_enabled = auto_rs or auto_ar
@@ -330,12 +326,12 @@ class RobloxRejoinEngine:
                         left, top = (i % cols) * sw, (i // cols) * sh
                         grid_bounds.append(f"{left},{top},{left+sw},{top+sh}")
 
-                # --- ĐỢT 2: JOIN GAME & ÉP KÍCH THƯỚC ---
+                # --- ĐỢT 2: BẮN DEEP LINK VÀO APP ĐÃ WARM-UP ---
                 self.global_status = "Đang chạy Đợt 2: Join Game & Áp dụng Config..."
                 for i, pkg in enumerate(pkgs):
-                    self.status_map[pkg] = "Đợt 2: Đang Join Game..."
+                    self.status_map[pkg] = "Đợt 2: Đang bắn lệnh Join..."
                     link = self.config.get("server_links", {}).get(pkg, "")
-                    place_id, job_id, link_code = self.parse_place_info(link)
+                    place_id, job_id, link_code, share_code = self.parse_place_info(link)
                     
                     if not place_id:
                         self.status_map[pkg] = "Lỗi: Link/ID trống"
@@ -344,19 +340,30 @@ class RobloxRejoinEngine:
                     if with_bypass: self.device.set_android_id(os.urandom(8).hex())
                     
                     b_str = grid_bounds[i] if auto_ar else ("0,0,500,700" if auto_rs else None)
-                    self.device.launch_place(pkg, place_id, job_id, link_code, freeform=freeform_enabled, bounds=b_str)
-                    time.sleep(4)
-                    self.status_map[pkg] = "Joined"
+                    
+                    # SỬA LỖI: Kiểm tra kết quả thực tế từ lệnh am start
+                    success = self.device.launch_place(pkg, place_id, job_id, link_code, share_code, freeform=freeform_enabled, bounds=b_str)
+                    
+                    if success:
+                        self.status_map[pkg] = "Joined"
+                    else:
+                        # Fallback Retry 1 lần nếu lệnh bị từ chối
+                        self.status_map[pkg] = "Retry Launching..."
+                        time.sleep(2)
+                        retry = self.device.launch_place(pkg, place_id, job_id, link_code, share_code, freeform=False) # Tắt thử size
+                        self.status_map[pkg] = "Joined" if retry else "Lỗi Mở Game"
+                    
+                    time.sleep(4) # Chờ game load hòm hòm rồi mới mở acc tiếp theo
 
                 # --- XỬ LÝ ĐẾM LÙI ---
                 if interval_seconds <= 0:
-                    self.global_status = "Hoàn tất! Các tab đang được giữ nguyên (Không lặp lại)."
+                    self.global_status = "Hoàn tất! Các tab đang được giữ nguyên ở nền."
                     while True: time.sleep(1)
                 else:
                     for remaining in range(interval_seconds, 0, -1):
                         mins = remaining // 60
                         secs = remaining % 60
-                        self.global_status = f"Chu kỳ tiếp theo sau: {mins} phút {secs} giây"
+                        self.global_status = f"Chu kỳ khởi động lại tiếp theo sau: {mins} phút {secs} giây"
                         time.sleep(1)
 
         except KeyboardInterrupt:
