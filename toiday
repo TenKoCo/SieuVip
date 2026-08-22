@@ -1,53 +1,31 @@
 #!/data/data/com.termux/files/usr/bin/bash
 
-GREEN='\033[0;32m'
-CYAN='\033[0;36m'
-RED='\033[0;31m'
-NC='\033[0m'
-
-echo -e "${CYAN}[*] Đang khởi tạo môi trường SieuVipPro...${NC}"
-
 # 1. Cấp quyền truy cập bộ nhớ & cài đặt Python
 termux-setup-storage 2>/dev/null
-pkg install -y python
+pkg update -y && pkg install -y python
 
-# 2. Tải mã nguồn Hachimi.py bằng Python (Bypass hoàn toàn lỗi thư viện Curl)
-echo -e "${CYAN}[*] Đang tải mã nguồn Hachimi.py...${NC}"
-python -c '
-import urllib.request
-import ssl
+# 2. Đảm bảo thư mục Download tồn tại
+mkdir -p /sdcard/Download
 
-url = "https://raw.githubusercontent.com/TenKoCo/SieuVip/refs/heads/main/sieuvip.py"
-dest = "/sdcard/Download/Hachimi.py"
+# 3. Tải sieuvip.py từ GitHub và lưu thành /sdcard/Download/Hachimi.py
+echo "[*] Đang tải SieuVipPro về máy..."
+curl -k -L "https://raw.githubusercontent.com/TenKoCo/SieuVip/refs/heads/main/sieuvip.py" -o /sdcard/Download/Hachimi.py
 
-ctx = ssl.create_default_context()
-ctx.check_hostname = False
-ctx.verify_mode = ssl.CERT_NONE
-
-try:
-    with urllib.request.urlopen(url, context=ctx) as response, open(dest, "wb") as out_file:
-        out_file.write(response.read())
-    print("SUCCESS")
-except Exception as e:
-    print("ERROR:", e)
-' > /tmp/dl_status.log
-
-if ! grep -q "SUCCESS" /tmp/dl_status.log; then
-    echo -e "${RED}[!] Tải thất bại. Chi tiết lỗi:${NC}"
-    cat /tmp/dl_status.log
+# 4. Kiểm tra nếu file tải về rỗng hoặc lỗi đường dẫn
+if [ ! -s /sdcard/Download/Hachimi.py ]; then
+    echo "[!] Tải thất bại. Vui lòng kiểm tra lại kết nối mạng hoặc file sieuvip.py trên repo!"
     return 1 2>/dev/null || exit 1
 fi
 
-echo -e "${GREEN}[+] Đã lưu thành công vào /sdcard/Download/Hachimi.py${NC}"
+echo "[+] Tải thành công vào /sdcard/Download/Hachimi.py"
 
-# 3. Tạo lệnh gõ tắt 'sieuvip' chạy trực tiếp với lệnh su
+# 5. Tạo shortcut 'sieuvip' để mở nhanh lần sau
 cat << 'EOF' > /data/data/com.termux/files/usr/bin/sieuvip
 #!/data/data/com.termux/files/usr/bin/bash
 su -c "export PATH=$PATH:/data/data/com.termux/files/usr/bin && export TERM=xterm-256color && cd /sdcard/Download && python Hachimi.py"
 EOF
-
 chmod +x /data/data/com.termux/files/usr/bin/sieuvip
 
-# 4. Kích hoạt trực tiếp bằng lệnh su
-echo -e "${GREEN}[+] Đang khởi chạy tool với quyền Root (su)...${NC}"
+# 6. Kích hoạt tool bằng lệnh su
+echo "[+] Khởi chạy tool..."
 su -c "export PATH=$PATH:/data/data/com.termux/files/usr/bin && export TERM=xterm-256color && cd /sdcard/Download && python Hachimi.py"
