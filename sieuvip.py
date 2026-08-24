@@ -776,7 +776,7 @@ def validate_roblox_cookie(cookie: str, timeout: float = 10.0) -> Tuple[bool, st
 
 
 class CookieInstaller:
-    PREF_NAME = "com.roblox.client_preferences.xml"
+    """Deep injection of RBXSession + Cache Cleanup + UID Ownership + SELinux Restore."""
 
     def __init__(
         self,
@@ -802,22 +802,52 @@ class CookieInstaller:
         if not c.startswith("_|WARNING:-DO-NOT-SHARE-THIS"):
             c = "_|WARNING:-DO-NOT-SHARE-THIS.--Sharing-this-will-allow-someone-to-log-into-your-account-and-rob-your-robox.--|_" + c
 
-        xml_path = f"/data/data/{package}/shared_prefs/{self.PREF_NAME}"
-        # Ghi trực tiếp không dùng sed regex delimiter để tránh xung đột ký tự '|'
-        cmd = (
-            f"mkdir -p /data/data/{package}/shared_prefs && "
-            f"if [ ! -f '{xml_path}' ]; then "
-            f"echo '<?xml version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\" ?><map><string name=\"RBXSession\">{c}</string></map>' > '{xml_path}'; "
-            f"else "
-            f"grep -v '\"RBXSession\"' '{xml_path}' | sed 's|</map>||g' > '{xml_path}.tmp' 2>/dev/null; "
-            f"echo '<string name=\"RBXSession\">{c}</string></map>' >> '{xml_path}.tmp'; "
-            f"mv -f '{xml_path}.tmp' '{xml_path}'; "
-            f"fi && chmod 660 '{xml_path}' && chown $(stat -c '%u:%g' /data/data/{package}) '{xml_path}'"
-        )
-        write_result = self.backend.run(["sh", "-c", cmd], timeout=self.command_timeout)
+        # Script xử lý tầng sâu: Dọn cache, gán XML, sửa UID/GID và khôi phục SELinux
+        script = f"""
+pkg="{package}"
+app_dir="/data/data/$pkg"
+if [ ! -d "$app_dir" ] && [ -d "/data/user/0/$pkg" ]; then
+    app_dir="/data/user/0/$pkg"
+fi
+
+# 1. Dừng app hoàn toàn
+am force-stop "$pkg" 2>/dev/null
+killall -9 "$pkg" 2>/dev/null
+
+# 2. Lấy UID và GID sở hữu của App
+owner=$(stat -c '%u:%g' "$app_dir" 2>/dev/null)
+if [ -z "$owner" ]; then
+    owner="1000:1000"
+fi
+
+# 3. Dọn dẹp cache / database / webview cũ (nguyên nhân gây đè cookie)
+rm -rf "$app_dir/app_webview" "$app_dir/cache" "$app_dir/code_cache" "$app_dir/databases" "$app_dir/files/GuestData" 2>/dev/null
+
+# 4. Tạo thư mục shared_prefs chuẩn
+mkdir -p "$app_dir/shared_prefs"
+
+# 5. Ghi thẳng XML Session
+cat << 'EOF' > "$app_dir/shared_prefs/com.roblox.client_preferences.xml"
+<?xml version='1.0' encoding='utf-8' standalone='yes' ?>
+<map>
+    <string name="RBXSession">{c}</string>
+    <string name="RBXSessionToken">{c}</string>
+</map>
+EOF
+
+# 6. Phân quyền và khôi phục SELinux Context
+chown -R "$owner" "$app_dir/shared_prefs"
+chmod 771 "$app_dir/shared_prefs"
+chmod 660 "$app_dir/shared_prefs/com.roblox.client_preferences.xml"
+
+if [ -x /system/bin/restorecon ]; then
+    /system/bin/restorecon -RF "$app_dir" >/dev/null 2>&1 || true
+fi
+"""
+        write_result = self.backend.run(["sh", "-c", script], timeout=self.command_timeout)
         if not write_result.ok:
-            return False, f"Lỗi ghi XML: {_compact(write_result.output)}"
-        return True, "Đã ghi RBXSession vào XML thành công"
+            return False, f"Lỗi inject: {_compact(write_result.output)}"
+        return True, "Đã inject cookie và đồng bộ SELinux thành công"
 
 
 class AndroidController:
@@ -1124,7 +1154,6 @@ class RejoinEngine:
             if once or self.stop_requested:
                 break
 
-            # Vòng lặp Watchdog giám sát liên tục từng 5s
             deadline = time.monotonic() + (
                 self.config.interval_seconds if self.config.interval_seconds > 0 else 86400 * 365
             )
@@ -1361,13 +1390,14 @@ def _login_cookie_menu(
             logger.error("[%s] Cookie lỗi: %s", target.package, val_msg)
             continue
         logger.info("[%s] %s", target.package, val_msg)
-        controller.force_stop(target.package)
-        ok, _ = installer.apply(target.package, c)
+        ok, detail = installer.apply(target.package, c)
         if ok:
             succeeded += 1
             controller.start_lobby(target.package)
-            time.sleep(1.0)
-    logger.info("Đã đăng nhập thành công cho %d/%d package", succeeded, len(config.targets))
+            time.sleep(1.5)
+        else:
+            logger.error("[%s] Inject lỗi: %s", target.package, detail)
+    logger.info("Đã hoàn tất đăng nhập cho %d/%d package", succeeded, len(config.targets))
     return 0
 
 
@@ -1414,7 +1444,7 @@ def interactive_menu(
         print(f"│ {Colors.MAGENTA}   2{Colors.RESET}  │ {Colors.CYAN}Nhập Game ID / Link Server VIP                         {Colors.RESET}│")
         print(f"│ {Colors.MAGENTA}   3{Colors.RESET}  │ {Colors.CYAN}Chọn Package Roblox để chạy                            {Colors.RESET}│")
         print(f"│ {Colors.MAGENTA}   4{Colors.RESET}  │ {Colors.CYAN}Mở tất cả App lên nền (Warm-up)                        {Colors.RESET}│")
-        print(f"│ {Colors.MAGENTA}   5{Colors.RESET}  │ {Colors.CYAN}Login Cookie tự động qua Root (sed/grep)               {Colors.RESET}│")
+        print(f"│ {Colors.MAGENTA}   5{Colors.RESET}  │ {Colors.CYAN}Login Cookie tự động qua Root (Deep Inject)            {Colors.RESET}│")
         print(f"│ {Colors.MAGENTA}  13{Colors.RESET}  │ {Colors.GREEN}Cấu hình Nâng cao (Grid / Heartbeat Watchdog)          {Colors.RESET}│")
         print(f"│ {Colors.MAGENTA}   0{Colors.RESET}  │ {Colors.RED}Thoát Hệ Thống                                         {Colors.RESET}│")
         print("└──────┴────────────────────────────────────────────────────────┘")
