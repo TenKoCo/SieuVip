@@ -14,10 +14,9 @@ _svr_setup_main() {
     local actual_sha256
     local config_file
     local cookie_store
-    local root_command
 
     engine_url="${SIEUVIP_REJOIN_URL:-https://raw.githubusercontent.com/TenKoCo/SieuVip/refs/heads/main/sieuvip.py}"
-    expected_sha256="${SIEUVIP_REJOIN_SHA256:-e8e9e420c8c5fca40c111b36587c7de4afcc8cc3cd6742848a236282328e24b2}"
+    expected_sha256="${SIEUVIP_REJOIN_SHA256:-29baf42bf6ce417b43f77238a63a66117ebb5bd58ee9fb55988c894cb7817c14}"
     cache_dir="${XDG_DATA_HOME:-${HOME}/.local/share}/sieuvip-rejoin"
     engine_file="${cache_dir}/sieuvip.py"
     temporary_file="${engine_file}.download.$$"
@@ -104,8 +103,10 @@ _svr_setup_main() {
         return 1
     fi
 
-    root_command="export PATH='/data/data/com.termux/files/usr/bin:/system/bin:/system/xbin'; export HOME='${HOME}'; export TERM='xterm-256color'; cd '${HOME}'; exec '${python_bin}' '${engine_file}' --config '${config_file}' --cookies '${cookie_store}' --backend direct menu"
-    "${su_bin}" -c "${root_command}"
+    printf '%s\n' '[+] Đã tải và cài đặt SieuVipPro thành công.'
+    printf '%s\n' '[+] Tool chưa được chạy tự động.'
+    printf '%s\n' '[+] Chạy thủ công bằng lệnh:'
+    printf '%s\n' "${su_bin} -c \"export PATH='/data/data/com.termux/files/usr/bin:/system/bin:/system/xbin'; export HOME='${HOME}'; export TERM='xterm-256color'; cd '${HOME}'; exec '${python_bin}' '${engine_file}' --config '${config_file}' --cookies '${cookie_store}' --backend direct menu\""
 }
 
 _svr_setup_main "$@"
