@@ -53,6 +53,7 @@ SYSTEM_PATH = (
 SYSTEM_COMMANDS = {
     "am",
     "cmd",
+    "dumpsys",
     "getprop",
     "id",
     "monkey",
@@ -1217,9 +1218,39 @@ class AndroidController:
         return False, result.output
 
     def is_process_running(self, package: str) -> Tuple[bool, str]:
-        result = self.backend.run(["pidof", package], timeout=10)
-        running = self.command_accepted(result) and bool(result.stdout.strip())
-        return running, result.output
+        process_result = self.backend.run(["pidof", package], timeout=10)
+        process_running = self.command_accepted(process_result) and bool(
+            process_result.stdout.strip()
+        )
+        if not process_running:
+            return False, process_result.output or "Không thấy PID"
+
+        # Đóng cửa sổ/freeform task không phải lúc nào cũng giết process ngay.
+        # Kiểm tra Activity/task để không nhầm một process cached là game còn mở.
+        activity_result = self.backend.run(
+            ["dumpsys", "activity", "-p", package, "activities"], timeout=15
+        )
+        if not activity_result.ok:
+            # ROM không hỗ trợ filter dumpsys: fallback về PID để tránh rejoin lặp.
+            return True, process_result.output
+        package_lower = package.lower()
+        activity_markers = (
+            "activityrecord{",
+            "mresumedactivity",
+            "topresumedactivity",
+            "realactivity=",
+            "origactivity=",
+            "topactivity=",
+            "task{",
+        )
+        task_running = any(
+            package_lower in line.lower()
+            and any(marker in line.lower() for marker in activity_markers)
+            for line in activity_result.output.splitlines()
+        )
+        if task_running:
+            return True, process_result.output
+        return False, "PID còn tồn tại nhưng không còn Activity/task Roblox"
 
     def get_screen_size(self) -> Tuple[int, int]:
         result = self.backend.run(["wm", "size"], timeout=10)
@@ -2076,7 +2107,7 @@ def _login_cookie_menu(
 
 def _health_method_menu_label(config: RejoinConfig) -> str:
     return {
-        "online": "Check Online (tiến trình Android)",
+        "online": "Check Online (tiến trình + task Android)",
         "heartbeat": "Check Executor (Heartbeat HTTPS)",
     }.get(config.health_check_method, config.health_check_method)
 
@@ -2122,7 +2153,7 @@ def _config_menu(config: RejoinConfig, config_path: Path) -> None:
                 + ("bật." if config.auto_arrange else "tắt.")
             )
         elif choice == "4":
-            print("\n1. Check Online (kiểm tra tiến trình package)")
+            print("\n1. Check Online (kiểm tra tiến trình và task package)")
             print("2. Check Executor (Heartbeat HTTPS hợp lệ)")
             method_choice = input("Chọn method [1/2]: ").strip()
             if method_choice == "1":
