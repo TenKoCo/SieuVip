@@ -1080,8 +1080,35 @@ class AndroidController:
         return result.ok and not any(marker in lowered for marker in cls.FAILURE_MARKERS)
 
     def preflight(self) -> Tuple[bool, str]:
-        result = self.backend.run(["am", "help"], timeout=12)
-        return self.command_accepted(result), result.output
+        # Một số ROM trả exit code khác 0 cho `am help` dù Activity Manager hoạt
+        # động bình thường. Ưu tiên một lệnh chỉ đọc có kết quả xác định.
+        current_user = self.backend.run(
+            ["am", "get-current-user"], timeout=12
+        )
+        if self.command_accepted(current_user) and re.search(
+            r"(?m)^\s*\d+\s*$", current_user.stdout or current_user.output
+        ):
+            return True, current_user.output
+
+        help_result = self.backend.run(["am", "help"], timeout=12)
+        help_text = help_result.output.lower()
+        help_is_valid = (
+            "activity manager" in help_text
+            and "start-activity" in help_text
+            and not any(
+                marker in help_text
+                for marker in (
+                    "securityexception",
+                    "permission denial",
+                    "not allowed",
+                    "not found",
+                )
+            )
+        )
+        if help_is_valid:
+            return True, help_result.output
+        detail = current_user.output or help_result.output
+        return False, detail
 
     def force_stop(self, package: str) -> Tuple[bool, str]:
         if not self.backend.can_force_stop:
