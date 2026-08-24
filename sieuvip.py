@@ -1,9 +1,5 @@
 #!/data/data/com.termux/files/usr/bin/python
-"""SieuVip Roblox rejoin engine designed for Termux on Android.
-
-Implements cURL-based HTTPS Auth Ticket handshake, Multi-Package Deep Linking,
-and Root-level Cookie Extractor from active Roblox sessions.
-"""
+"""SieuVip Roblox Engine & Direct Cookie Extractor for Android."""
 
 from __future__ import annotations
 
@@ -688,51 +684,39 @@ class RobloxHTTPSAuth:
         if ticket_match:
             return ticket_match.group(1).strip(), "OK"
 
-        return None, "Roblox không cấp Auth Ticket (Có thể cần xác minh trình duyệt)"
+        return None, "Roblox không cấp Auth Ticket"
 
 
-class CookieExtractor:
-    """Extracts .ROBLOSECURITY from active Android Roblox app data."""
+class DirectCookieExtractor:
+    """Extracts .ROBLOSECURITY directly from SQLite WebView databases and Shared Preferences."""
 
     @classmethod
     def extract_from_package(cls, backend: AndroidBackend, package: str) -> Tuple[Optional[str], str]:
+        # Trích xuất trực tiếp bằng Root từ SQLite Database Cookies của Chromium WebView
         script = f"""
 pkg="{package}"
 app_dir="/data/data/$pkg"
-if [ ! -d "$app_dir" ] && [ -d "/data/user/0/$pkg" ]; then
-    app_dir="/data/user/0/$pkg"
-fi
+[ ! -d "$app_dir" ] && app_dir="/data/user/0/$pkg"
 
-# 1. Quét tìm chuỗi cookie trong toàn bộ dữ liệu SQLite và XML của app
-grep -aohE '_\|WARNING:-DO-NOT-SHARE-THIS\.[^"\'<>[:space:]]+' "$app_dir" 2>/dev/null | head -n 1
+# 1. Trích xuất trực tiếp chuỗi WARNING trong file SQLite Cookies và SharedPrefs
+strings "$app_dir/app_webview/Default/Cookies" 2>/dev/null | grep -E '_\\|WARNING:[^[:space:]]+' | head -n 1
+strings "$app_dir/app_webview/Default/Network/Cookies" 2>/dev/null | grep -E '_\\|WARNING:[^[:space:]]+' | head -n 1
+strings "$app_dir/app_webview/Cookies" 2>/dev/null | grep -E '_\\|WARNING:[^[:space:]]+' | head -n 1
+grep -aohE '_\\|WARNING:-DO-NOT-SHARE-THIS\\.[^"\'<>[:space:]]+' "$app_dir/shared_prefs/" 2>/dev/null | head -n 1
+grep -aohE '_\\|WARNING:-DO-NOT-SHARE-THIS\\.[^"\'<>[:space:]]+' "$app_dir" 2>/dev/null | head -n 1
 """
         res = backend.run(["sh", "-c", script], timeout=15)
-        raw_found = res.stdout.strip()
+        raw_outputs = [line.strip() for line in res.stdout.splitlines() if line.strip()]
 
-        if raw_found and len(raw_found) >= 50:
-            try:
-                norm = RobloxHTTPSAuth.normalize_cookie(raw_found)
-                return norm, "Trích xuất thành công từ bộ nhớ App"
-            except Exception:
-                pass
+        for item in raw_outputs:
+            if "_|WARNING:" in item and len(item) >= 50:
+                try:
+                    norm = RobloxHTTPSAuth.normalize_cookie(item)
+                    return norm, "Trích xuất thành công từ bộ nhớ App"
+                except Exception:
+                    continue
 
-        # Fallback quét từ file XML shared_prefs nếu grep trực tiếp chưa ra
-        script_fallback = f"""
-pkg="{package}"
-app_dir="/data/data/$pkg"
-[ ! -d "$app_dir" ] && app_dir="/data/user/0/$pkg"
-grep -a 'RBXSession' "$app_dir/shared_prefs/"*.xml 2>/dev/null | sed -n 's/.*<string name="RBXSession">\\(.*\\)<\\/string>.*/\\1/p' | head -n 1
-"""
-        res_fb = backend.run(["sh", "-c", script_fallback], timeout=10)
-        fb_found = res_fb.stdout.strip()
-        if fb_found and len(fb_found) >= 50:
-            try:
-                norm = RobloxHTTPSAuth.normalize_cookie(fb_found)
-                return norm, "Trích xuất thành công từ Shared Preferences"
-            except Exception:
-                pass
-
-        return None, "Không tìm thấy session Cookie nào đang hoạt động trong app này"
+        return None, "Không tìm thấy session Cookie nào đang lưu trong app này"
 
 
 class CookieStore:
@@ -1469,28 +1453,28 @@ def _export_cookies_menu(
     if not config.targets:
         raise ConfigError("Chưa chọn package. Vui lòng vào mục 3 trước.")
 
-    print(f"\n{Colors.CYAN}[*] Đang quét session Cookie từ các app đã chọn...{Colors.RESET}\n")
+    print(f"\n{Colors.CYAN}[*] Đang đọc trực tiếp Session Cookie từ dữ liệu các App trên máy...{Colors.RESET}\n")
     results = []
 
     for target in config.targets:
-        cookie, msg = CookieExtractor.extract_from_package(backend, target.package)
+        cookie, msg = DirectCookieExtractor.extract_from_package(backend, target.package)
         if cookie:
             valid, user, uid, val_msg = RobloxHTTPSAuth.validate_cookie(cookie)
             info = f"Acc: {user} (ID: {uid})" if valid else "Session offline/chưa rõ"
-            print(f"[{Colors.GREEN}✓{Colors.RESET}] {target.package} -> {info}")
-            print(f"    Cookie: {cookie[:40]}...{cookie[-15:]}\n")
-            results.append(f"{target.package} | {info}\n{cookie}\n")
+            print(f"[{Colors.GREEN}✓{Colors.RESET}] {Colors.BOLD}{target.package}{Colors.RESET} -> {info}")
+            print(f"    Cookie: {cookie}\n")
+            results.append(f"{cookie}")
         else:
-            print(f"[{Colors.RED}✗{Colors.RESET}] {target.package} -> {msg}")
+            print(f"[{Colors.RED}✗{Colors.RESET}] {target.package} -> {msg}\n")
 
     if results:
         DEFAULT_EXPORT_COOKIE_PATH.write_text("\n".join(results), encoding="utf-8")
         print(f"{Colors.GREEN}======================================================{Colors.RESET}")
-        print(f"Đã lưu toàn bộ Cookie hợp lệ vào:")
+        print(f"Đã xuất và lưu toàn bộ Cookie vào:")
         print(f"{Colors.BOLD}{DEFAULT_EXPORT_COOKIE_PATH}{Colors.RESET}")
         print(f"{Colors.GREEN}======================================================{Colors.RESET}")
     else:
-        print(f"\n{Colors.YELLOW}Không trích xuất được cookie nào từ các package trên.{Colors.RESET}")
+        print(f"\n{Colors.YELLOW}Không tìm thấy session Cookie nào đang lưu trong các package đã chọn.{Colors.RESET}")
 
 
 def _config_menu(config: RejoinConfig, config_path: Path) -> None:
@@ -1540,7 +1524,7 @@ def interactive_menu(
         print(f"│ {Colors.MAGENTA}   3{Colors.RESET}  │ {Colors.CYAN}Chọn Package Roblox để chạy                            {Colors.RESET}│")
         print(f"│ {Colors.MAGENTA}   4{Colors.RESET}  │ {Colors.CYAN}Mở tất cả App lên nền (Warm-up)                        {Colors.RESET}│")
         print(f"│ {Colors.MAGENTA}   5{Colors.RESET}  │ {Colors.CYAN}Xác thực Cookie cURL & Mở Game qua Vé Auth Ticket      {Colors.RESET}│")
-        print(f"│ {Colors.MAGENTA}   6{Colors.RESET}  │ {Colors.GREEN}Xuất Cookie từ các App Roblox đang đăng nhập trên máy  {Colors.RESET}│")
+        print(f"│ {Colors.MAGENTA}   6{Colors.RESET}  │ {Colors.GREEN}Xuất trực tiếp Cookie từ các App đang lưu trên máy     {Colors.RESET}│")
         print(f"│ {Colors.MAGENTA}  13{Colors.RESET}  │ {Colors.GREEN}Cấu hình Nâng cao (Grid / Heartbeat Watchdog)          {Colors.RESET}│")
         print(f"│ {Colors.MAGENTA}   0{Colors.RESET}  │ {Colors.RED}Thoát Hệ Thống                                         {Colors.RESET}│")
         print("└──────┴────────────────────────────────────────────────────────┘")
