@@ -39,6 +39,8 @@ DEFAULT_CONFIG_PATH = Path.home() / ".config" / APP_NAME / "config.json"
 DEFAULT_COOKIE_PATH = Path.home() / ".config" / APP_NAME / "cookies.json"
 DEFAULT_LOG_PATH = Path.home() / ".local" / "state" / APP_NAME / "rejoin.log"
 DEFAULT_LOCK_PATH = Path.home() / ".local" / "state" / APP_NAME / "rejoin.lock"
+DEFAULT_COOKIE_SOURCE_PATH = Path("/sdcard/Download/cookie.txt")
+DEFAULT_BLOX_FRUITS_PLACE_ID = "2753915549"
 PACKAGE_RE = re.compile(r"^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+$")
 BOUNDS_RE = re.compile(r"^\d+,\d+,\d+,\d+$")
 SYSTEM_PATH = (
@@ -151,9 +153,6 @@ class RejoinConfig:
                                 {"package": package_text, "link": link}
                             )
                         )
-
-        if not targets:
-            raise ConfigError("Config chưa có target Roblox nào")
 
         interval = raw.get("interval_seconds")
         if interval is None:
@@ -741,10 +740,6 @@ class CookieStore:
                 for line in content.splitlines()
                 if line.strip() and not line.lstrip().startswith("#")
             ]
-            if len(lines) > len(packages):
-                raise ConfigError(
-                    "cookie.txt có nhiều cookie hơn số package trong config"
-                )
             for package, cookie in zip(packages, lines):
                 mapping[package] = cls.normalize_record(cookie)
 
@@ -1467,13 +1462,23 @@ def login_cookies(
     for target in targets:
         cookie = cookies.get(target.package)
         if not cookie:
-            logger.error("[%s] Thiếu cookie", target.package)
-            continue
+            logger.warning(
+                "Đã hết cookie; dừng trước package %s", target.package
+            )
+            break
         controller.force_stop(target.package)
         ok, detail = installer.apply(target.package, cookie)
         if ok:
             succeeded += 1
             logger.info("[%s] Cookie đăng nhập đã sẵn sàng", target.package)
+            opened, open_detail = controller.start_lobby(target.package)
+            if not opened:
+                logger.warning(
+                    "[%s] Đã inject cookie nhưng không mở được app: %s",
+                    target.package,
+                    _compact(open_detail),
+                )
+            time.sleep(max(0.0, config.between_apps_seconds))
         else:
             logger.error(
                 "[%s] Inject cookie thất bại: %s", target.package, _compact(detail)
@@ -1491,6 +1496,221 @@ def list_packages(controller: AndroidController, keyword: str) -> int:
         if not keyword or keyword in package.lower():
             print(package)
     return 0
+
+
+def _load_menu_config(path: Path) -> RejoinConfig:
+    if path.exists():
+        return load_config(path)
+    return RejoinConfig(targets=[])
+
+
+def match_package_prefix(packages: Sequence[str], raw_prefix: str) -> List[str]:
+    """Match an Android package prefix on component boundaries.
+
+    For example, ``com`` matches ``com.roblox.client`` but not ``company.app``.
+    A complete package name is also accepted.
+    """
+    prefix = raw_prefix.strip().lower().rstrip(".")
+    if not prefix:
+        raise ConfigError("Bạn chưa nhập tên đầu package")
+    if not re.fullmatch(r"[a-z0-9_]+(?:\.[a-z0-9_]+)*", prefix):
+        raise ConfigError(f"Tên đầu package không hợp lệ: {raw_prefix!r}")
+    return [
+        package
+        for package in packages
+        if package.lower() == prefix or package.lower().startswith(prefix + ".")
+    ]
+
+
+def _menu_targets(config: RejoinConfig) -> List[TargetConfig]:
+    return [target for target in config.targets if target.enabled]
+
+
+def _require_menu_targets(config: RejoinConfig) -> List[TargetConfig]:
+    targets = _menu_targets(config)
+    if not targets:
+        raise ConfigError("Chưa chọn package. Hãy dùng chức năng 3 trước.")
+    return targets
+
+
+def _configure_menu_packages(
+    config: RejoinConfig,
+    config_path: Path,
+    controller: AndroidController,
+) -> None:
+    packages, error = controller.list_packages()
+    if not packages:
+        raise BackendError("Không liệt kê được package: " + _compact(error))
+
+    prefix = input(
+        "Nhập tên đầu package để chạy (ví dụ com hoặc com.roblox): "
+    )
+    selected = match_package_prefix(packages, prefix)
+    if not selected:
+        raise ConfigError(f"Không tìm thấy package bắt đầu bằng {prefix.strip()!r}")
+
+    old_targets = {target.package: target for target in config.targets}
+    config.targets = []
+    for package in selected:
+        old = old_targets.get(package)
+        link = old.link if old and RobloxLaunchSpec.parse(old.link).is_valid() else (
+            DEFAULT_BLOX_FRUITS_PLACE_ID
+        )
+        config.targets.append(
+            TargetConfig(
+                package=package,
+                link=link,
+                enabled=True,
+                bounds=old.bounds if old else None,
+            )
+        )
+    # Cookie login is an explicit menu action, not a side effect of auto rejoin.
+    config.auto_login_cookies = False
+    save_config(config_path, config)
+
+    print(f"\nĐã chọn {len(config.targets)} package theo đúng thứ tự sau:")
+    for index, target in enumerate(config.targets, start=1):
+        print(f"  {index}. {target.package}")
+
+
+def _configure_menu_links(config: RejoinConfig, config_path: Path) -> None:
+    targets = _require_menu_targets(config)
+    print("\n1. Nhập cho tất cả các package")
+    print("2. Nhập cho từng package")
+    mode = input("Chọn cách nhập [1/2]: ").strip()
+    if mode not in {"1", "2"}:
+        raise ConfigError("Chỉ chấp nhận lựa chọn 1 hoặc 2")
+
+    if mode == "1":
+        raw_link = input(
+            "Nhập Game ID hoặc ServerVip [Enter = Blox Fruits]: "
+        ).strip()
+        link = raw_link or DEFAULT_BLOX_FRUITS_PLACE_ID
+        if not RobloxLaunchSpec.parse(link).is_valid():
+            raise ConfigError("Game ID hoặc ServerVip không hợp lệ")
+        for target in targets:
+            target.link = link
+    else:
+        print("\nCác package đã chọn ở chức năng 3:")
+        updates: List[Tuple[TargetConfig, str]] = []
+        for index, target in enumerate(targets, start=1):
+            raw_link = input(
+                f"{index}. {target.package} [Enter = Blox Fruits]: "
+            ).strip()
+            link = raw_link or DEFAULT_BLOX_FRUITS_PLACE_ID
+            if not RobloxLaunchSpec.parse(link).is_valid():
+                raise ConfigError(
+                    f"Game ID hoặc ServerVip của {target.package} không hợp lệ"
+                )
+            updates.append((target, link))
+        for target, link in updates:
+            target.link = link
+
+    save_config(config_path, config)
+    print("\nĐã lưu Game ID/ServerVip.")
+
+
+def _open_selected_apps(
+    config: RejoinConfig,
+    controller: AndroidController,
+    logger: logging.Logger,
+) -> int:
+    targets = _require_menu_targets(config)
+    opened = 0
+    for index, target in enumerate(targets):
+        ok, detail = controller.start_lobby(target.package)
+        if ok:
+            opened += 1
+            logger.info("[%s] Đã mở app", target.package)
+        else:
+            logger.error("[%s] Không mở được app: %s", target.package, _compact(detail))
+        if index + 1 < len(targets):
+            time.sleep(max(0.0, config.between_apps_seconds))
+    logger.info("Đã mở %d/%d package; không gửi lệnh join", opened, len(targets))
+    return 0 if opened == len(targets) else 2
+
+
+def _run_menu_rejoin(
+    config: RejoinConfig,
+    controller: AndroidController,
+    logger: logging.Logger,
+) -> int:
+    _require_menu_targets(config)
+    run_config = dataclasses.replace(config, auto_login_cookies=False)
+    engine = RejoinEngine(run_config, controller, logger)
+    old_sigint = signal.getsignal(signal.SIGINT)
+    old_sigterm = signal.getsignal(signal.SIGTERM)
+    try:
+        with SingleInstance(DEFAULT_LOCK_PATH), WakeLock(config.wake_lock, logger):
+            return engine.run(once=False)
+    finally:
+        signal.signal(signal.SIGINT, old_sigint)
+        signal.signal(signal.SIGTERM, old_sigterm)
+
+
+def interactive_menu(
+    config_path: Path,
+    cookie_source: Path,
+    requested_backend: str,
+    adb_serial: Optional[str],
+    logger: logging.Logger,
+) -> int:
+    """Run the five-option Termux menu and acquire Android privileges lazily."""
+    config = _load_menu_config(config_path)
+    cached_backend: Optional[AndroidBackend] = None
+
+    def get_android() -> Tuple[AndroidBackend, AndroidController]:
+        nonlocal cached_backend
+        if cached_backend is None:
+            cached_backend = select_backend(requested_backend, adb_serial)
+        controller = AndroidController(
+            cached_backend, logger, config.command_timeout_seconds
+        )
+        return cached_backend, controller
+
+    while True:
+        print("\033[2J\033[H", end="")
+        print("SieuVipPro Rejoin\n")
+        print("1. Start auto rejoin")
+        print("2. Nhap Game ID or ServerVip")
+        print("3. Chon Package de chay")
+        print("4. Open all roblox tab")
+        print("5. Login via cookie")
+        print("0. Thoat")
+        try:
+            choice = input("\nChọn chức năng: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\nĐã thoát.")
+            return 0
+
+        try:
+            if choice == "0":
+                return 0
+            if choice == "1":
+                _, controller = get_android()
+                _run_menu_rejoin(config, controller, logger)
+            elif choice == "2":
+                _configure_menu_links(config, config_path)
+            elif choice == "3":
+                _, controller = get_android()
+                _configure_menu_packages(config, config_path, controller)
+            elif choice == "4":
+                _, controller = get_android()
+                _open_selected_apps(config, controller, logger)
+            elif choice == "5":
+                backend, controller = get_android()
+                login_cookies(
+                    config, controller, backend, cookie_source, logger
+                )
+            else:
+                print("Lựa chọn không hợp lệ.")
+        except (AppError, ValueError) as exc:
+            logger.error("%s", exc)
+
+        try:
+            input("\nNhấn Enter để về menu...")
+        except (EOFError, KeyboardInterrupt):
+            return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1515,6 +1735,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--adb-serial", help="serial adb khi có nhiều device")
     parser.add_argument("--verbose", action="store_true", help="in log debug")
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    menu_parser = subparsers.add_parser("menu", help="mở menu SieuVipPro")
+    menu_parser.add_argument(
+        "--cookie-source",
+        type=Path,
+        default=DEFAULT_COOKIE_SOURCE_PATH,
+        help="cookie.txt dùng cho chức năng 5",
+    )
 
     init_parser = subparsers.add_parser("init", help="tạo config bằng menu")
     init_parser.add_argument("--force", action="store_true", help="ghi đè config")
@@ -1544,6 +1772,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log_path = DEFAULT_LOG_PATH
     logger = setup_logger(log_path, verbose=args.verbose)
     try:
+        # Menu phải xuất hiện trước mọi lần kiểm tra backend/root. Quyền Android
+        # chỉ được dùng sau khi người dùng chọn một chức năng cần tới nó.
+        if args.command == "menu":
+            return interactive_menu(
+                args.config,
+                args.cookie_source,
+                args.backend,
+                args.adb_serial,
+                logger,
+            )
+
         if args.command == "import-cookies":
             config = load_config(args.config)
             return import_cookies(config, args.source, args.cookies)
