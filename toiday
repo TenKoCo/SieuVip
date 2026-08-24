@@ -17,7 +17,7 @@ _svr_setup_main() {
     local root_command
 
     engine_url="${SIEUVIP_REJOIN_URL:-https://raw.githubusercontent.com/TenKoCo/SieuVip/refs/heads/main/sieuvip.py}"
-    expected_sha256="${SIEUVIP_REJOIN_SHA256:-26ca86e221f14a601a390c60098c864a8d398cd13c32c987e1445940c632a40b}"
+    expected_sha256="${SIEUVIP_REJOIN_SHA256:-e8e9e420c8c5fca40c111b36587c7de4afcc8cc3cd6742848a236282328e24b2}"
     cache_dir="${XDG_DATA_HOME:-${HOME}/.local/share}/sieuvip-rejoin"
     engine_file="${cache_dir}/sieuvip.py"
     temporary_file="${engine_file}.download.$$"
