@@ -1,21 +1,26 @@
 #!/data/data/com.termux/files/usr/bin/bash
 
-# 1. Cấp toàn bộ quyền truy cập bộ nhớ cho Termux qua Root
+# 1. Cấp toàn quyền bộ nhớ và tắt tối ưu pin cho Termux qua Root
 su -c "pm grant com.termux android.permission.READ_EXTERNAL_STORAGE 2>/dev/null"
 su -c "pm grant com.termux android.permission.WRITE_EXTERNAL_STORAGE 2>/dev/null"
 su -c "pm grant com.termux android.permission.MANAGE_EXTERNAL_STORAGE 2>/dev/null"
 su -c "appops set com.termux MANAGE_EXTERNAL_STORAGE allow 2>/dev/null"
-
-# 2. Tắt tối ưu hóa pin (chống Android kill Termux khi chạy nền)
 su -c "dumpsys deviceidle whitelist +com.termux 2>/dev/null"
 
-# 3. Tạo thư mục và phân quyền đọc/ghi tối đa
+# 2. Tạo vùng đệm /sdcard/Download
 mkdir -p /sdcard/Download
 chmod 777 /sdcard/Download 2>/dev/null
 
-# 4. Tải file sieuvip.py mới nhất từ GitHub
+# 3. Kéo bản sieuvip.py mới nhất
 curl -sL -H "Cache-Control: no-cache" https://raw.githubusercontent.com/TenKoCo/SieuVip/refs/heads/main/sieuvip.py -o /sdcard/Download/sieuvip.py
 chmod 777 /sdcard/Download/sieuvip.py 2>/dev/null
 
-# 5. Khởi chạy trực tiếp dưới quyền Root với môi trường chuẩn
-su -c "export PATH=\$PATH:/data/data/com.termux/files/usr/bin && export TERM=xterm-256color && cd /sdcard/Download && python sieuvip.py"
+# 4. Đăng ký alias surl chuẩn môi trường Root
+cat << 'EOF' > /data/data/com.termux/files/usr/bin/surl
+#!/data/data/com.termux/files/usr/bin/bash
+su -c "export PATH=$PATH:/data/data/com.termux/files/usr/bin:/system/bin:/system/xbin && export TERM=xterm-256color && cd /sdcard/Download && python sieuvip.py"
+EOF
+chmod +x /data/data/com.termux/files/usr/bin/surl
+
+# 5. Khởi chạy trực tiếp
+su -c "export PATH=\$PATH:/data/data/com.termux/files/usr/bin:/system/bin:/system/xbin && export TERM=xterm-256color && cd /sdcard/Download && python sieuvip.py"
