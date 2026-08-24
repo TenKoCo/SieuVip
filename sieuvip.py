@@ -1,9 +1,8 @@
 #!/data/data/com.termux/files/usr/bin/python
 """SieuVip Roblox rejoin engine designed for Termux on Android.
 
-Implements HTTPS Cookie verification, CSRF retrieval, Auth Ticket generation,
-and Intent Deep-Link launching for unattended 24/7 sessions.
-Supports raw cookies, tk:mk:cookie, and .ROBLOSECURITY formats.
+Implements cURL-based HTTPS Auth Ticket handshake and Multi-Package Deep Linking.
+Supports formats: tk:mk:cookie, raw cookie, and .ROBLOSECURITY header.
 """
 
 from __future__ import annotations
@@ -26,8 +25,6 @@ import subprocess
 import sys
 import time
 import urllib.parse
-import urllib.error
-import urllib.request
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 try:
@@ -596,16 +593,17 @@ def _select_adb_device(adb_path: str, requested_serial: Optional[str]) -> Option
 
 
 class RobloxHTTPSAuth:
-    """Handles Roblox HTTPS Cookie validation, CSRF Token retrieval, and Auth Ticket generation."""
+    """Uses curl via system to bypass Cloudflare TLS fingerprint blocks."""
+
+    USER_AGENT = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
 
     @staticmethod
     def normalize_cookie(raw_cookie: str) -> str:
         value = str(raw_cookie).strip().strip("'\"")
 
-        # Tự động nhận diện và bóc tách định dạng tk:mk:cookie hoặc user:pass:token:...
+        # Bóc tách tk:mk:cookie
         if ":" in value and not value.startswith("_|WARNING:") and not value.lower().startswith(".roblosecurity="):
             parts = value.split(":")
-            # Tìm phần tử có tiền tố cookie hoặc độ dài hợp lệ (>= 50 ký tự)
             for part in parts:
                 p_clean = part.strip()
                 if p_clean.startswith("_|WARNING:") or len(p_clean) >= 50:
@@ -624,95 +622,77 @@ class RobloxHTTPSAuth:
         return value
 
     @classmethod
-    def validate_cookie(cls, cookie: str, timeout: float = 10.0) -> Tuple[bool, Optional[str], Optional[int], str]:
+    def validate_cookie(cls, cookie: str) -> Tuple[bool, Optional[str], Optional[int], str]:
         try:
-            norm_cookie = cls.normalize_cookie(cookie)
-        except Exception as exc:
-            return False, None, None, str(exc)
+            norm = cls.normalize_cookie(cookie)
+        except Exception as e:
+            return False, None, None, str(e)
 
-        req = urllib.request.Request(
+        cmd = [
+            "curl", "-s", "-m", "10",
             "https://users.roblox.com/v1/users/authenticated",
-            headers={
-                "Cookie": f".ROBLOSECURITY={norm_cookie}",
-                "Accept": "application/json",
-                "User-Agent": "Roblox/Android",
-            },
-            method="GET",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                user_id = data.get("id")
-                user_name = data.get("name")
-                return True, user_name, user_id, f"Tài khoản: {user_name} (ID: {user_id})"
-        except urllib.error.HTTPError as exc:
-            if exc.code in (401, 403):
-                return False, None, None, "Cookie đã hết hạn hoặc bị Roblox từ chối"
-            return False, None, None, f"Lỗi kiểm tra Cookie: HTTP {exc.code}"
-        except Exception as exc:
-            return False, None, None, f"Lỗi kết nối tới Roblox: {exc}"
+            "-H", f"Cookie: .ROBLOSECURITY={norm}",
+            "-H", f"User-Agent: {cls.USER_AGENT}",
+            "-H", "Accept: application/json",
+            "-H", "Referer: https://www.roblox.com/"
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True)
+        if res.returncode != 0:
+            return False, None, None, "Không thể kết nối máy chủ Roblox (Lỗi cURL)"
 
-    @classmethod
-    def get_csrf_token(cls, norm_cookie: str, timeout: float = 10.0) -> Optional[str]:
-        req = urllib.request.Request(
-            "https://auth.roblox.com/v1/authentication-ticket/",
-            data=b"{}",
-            headers={
-                "Cookie": f".ROBLOSECURITY={norm_cookie}",
-                "Content-Type": "application/json",
-                "User-Agent": "Roblox/Android",
-                "Referer": "https://www.roblox.com/",
-            },
-            method="POST",
-        )
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return resp.headers.get("x-csrf-token")
-        except urllib.error.HTTPError as exc:
-            return exc.headers.get("x-csrf-token")
+            data = json.loads(res.stdout)
+            if "id" in data and "name" in data:
+                return True, data["name"], data["id"], f"Tài khoản: {data['name']} (ID: {data['id']})"
+            if "errors" in data:
+                return False, None, None, data["errors"][0].get("message", "Cookie bị từ chối")
         except Exception:
-            return None
+            pass
+
+        return False, None, None, "Cookie đã hết hạn hoặc bị chặn IP"
 
     @classmethod
-    def generate_auth_ticket(cls, cookie: str, timeout: float = 10.0) -> Tuple[Optional[str], str]:
+    def generate_auth_ticket(cls, cookie: str) -> Tuple[Optional[str], str]:
         try:
-            norm_cookie = cls.normalize_cookie(cookie)
-        except Exception as exc:
-            return None, str(exc)
+            norm = cls.normalize_cookie(cookie)
+        except Exception as e:
+            return None, str(e)
 
-        csrf = cls.get_csrf_token(norm_cookie, timeout)
-        if not csrf:
-            return None, "Không lấy được CSRF Token từ Roblox API"
+        # 1. Lấy CSRF Token
+        cmd_csrf = [
+            "curl", "-s", "-i", "-m", "10",
+            "-X", "POST", "https://auth.roblox.com/v1/authentication-ticket/",
+            "-H", f"Cookie: .ROBLOSECURITY={norm}",
+            "-H", f"User-Agent: {cls.USER_AGENT}",
+            "-H", "Origin: https://www.roblox.com",
+            "-H", "Referer: https://www.roblox.com/",
+            "-H", "Content-Length: 0"
+        ]
+        res_csrf = subprocess.run(cmd_csrf, capture_output=True, text=True)
+        csrf_match = re.search(r"(?i)x-csrf-token:\s*([^\r\n]+)", res_csrf.stdout)
+        if not csrf_match:
+            return None, "Không lấy được CSRF Token từ máy chủ"
+        csrf_token = csrf_match.group(1).strip()
 
-        req = urllib.request.Request(
-            "https://auth.roblox.com/v1/authentication-ticket/",
-            data=b"{}",
-            headers={
-                "Cookie": f".ROBLOSECURITY={norm_cookie}",
-                "Content-Type": "application/json",
-                "User-Agent": "Roblox/Android",
-                "Referer": "https://www.roblox.com/",
-                "x-csrf-token": csrf,
-                "RBXAuthenticationNegotiation": "1",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                ticket = resp.headers.get("rbx-authentication-ticket")
-                if ticket:
-                    return ticket.strip(), "OK"
-                try:
-                    payload = json.loads(resp.read().decode("utf-8"))
-                    if "ticket" in payload:
-                        return str(payload["ticket"]).strip(), "OK"
-                except Exception:
-                    pass
-                return None, "Roblox không cấp Auth Ticket"
-        except urllib.error.HTTPError as exc:
-            return None, f"Lỗi cấp Ticket: HTTP {exc.code}"
-        except Exception as exc:
-            return None, f"Lỗi kết nối cấp Ticket: {exc}"
+        # 2. Sinh Vé Auth Ticket
+        cmd_ticket = [
+            "curl", "-s", "-i", "-m", "10",
+            "-X", "POST", "https://auth.roblox.com/v1/authentication-ticket/",
+            "-H", f"Cookie: .ROBLOSECURITY={norm}",
+            "-H", f"x-csrf-token: {csrf_token}",
+            "-H", "RBXAuthenticationNegotiation: 1",
+            "-H", f"User-Agent: {cls.USER_AGENT}",
+            "-H", "Origin: https://www.roblox.com",
+            "-H", "Referer: https://www.roblox.com/",
+            "-H", "Content-Type: application/json",
+            "-d", "{}"
+        ]
+        res_ticket = subprocess.run(cmd_ticket, capture_output=True, text=True)
+        ticket_match = re.search(r"(?i)rbx-authentication-ticket:\s*([^\r\n]+)", res_ticket.stdout)
+        if ticket_match:
+            return ticket_match.group(1).strip(), "OK"
+
+        return None, "Roblox không cấp Auth Ticket (Có thể cần xác minh trình duyệt)"
 
 
 class CookieStore:
@@ -912,6 +892,36 @@ class AndroidController:
             timeout=self.command_timeout,
         )
         return self.command_accepted(result), result.output
+
+    def apply_shared_prefs_cookie(self, package: str, cookie: str) -> None:
+        """Inject fallback preferences into app shared_prefs directory."""
+        c = cookie
+        if not c.startswith("_|WARNING:-DO-NOT-SHARE-THIS"):
+            c = "_|WARNING:-DO-NOT-SHARE-THIS.--Sharing-this-will-allow-someone-to-log-into-your-account-and-rob-your-robox.--|_" + c
+
+        script = f"""
+pkg="{package}"
+app_dir="/data/data/$pkg"
+if [ ! -d "$app_dir" ] && [ -d "/data/user/0/$pkg" ]; then
+    app_dir="/data/user/0/$pkg"
+fi
+owner=$(stat -c '%u:%g' "$app_dir" 2>/dev/null || echo "1000:1000")
+mkdir -p "$app_dir/shared_prefs"
+
+for xml in "com.roblox.client_preferences.xml" "${{pkg}}_preferences.xml"; do
+    cat << 'EOF' > "$app_dir/shared_prefs/$xml"
+<?xml version='1.0' encoding='utf-8' standalone='yes' ?>
+<map>
+    <string name="RBXSession">{c}</string>
+    <string name="RBXSessionToken">{c}</string>
+</map>
+EOF
+    chmod 660 "$app_dir/shared_prefs/$xml"
+done
+chown -R "$owner" "$app_dir/shared_prefs"
+chmod 771 "$app_dir/shared_prefs"
+"""
+        self.backend.run(["sh", "-c", script], timeout=10)
 
     def start_deep_link(
         self,
@@ -1194,10 +1204,11 @@ class RejoinEngine:
         ticket = None
         cookie = self.cookies.get(target.package)
         if self.config.auto_login_cookies and cookie:
+            self.controller.apply_shared_prefs_cookie(target.package, cookie)
             t_val, t_msg = RobloxHTTPSAuth.generate_auth_ticket(cookie)
             if t_val:
                 ticket = t_val
-                self.logger.info("[%s] Đã nhận vé Auth Ticket mới từ máy chủ Roblox", target.package)
+                self.logger.info("[%s] Đã nhận vé Auth Ticket mới", target.package)
             else:
                 self.logger.warning("[%s] Không lấy được vé Auth Ticket: %s", target.package, t_msg)
 
@@ -1382,22 +1393,23 @@ def _check_and_launch_cookies(
         if not c:
             continue
 
-        print(f"\n{Colors.CYAN}[*] Đang kiểm tra Cookie cho package: {target.package}...{Colors.RESET}")
+        print(f"\n{Colors.CYAN}[*] Đang xác thực Cookie qua cURL cho package: {target.package}...{Colors.RESET}")
         valid, username, uid, msg = RobloxHTTPSAuth.validate_cookie(c)
         if not valid:
             logger.error("[%s] %s", target.package, msg)
             continue
         logger.info("[%s] Xác thực thành công: %s (ID: %s)", target.package, username, uid)
 
-        print(f"{Colors.YELLOW}[*] Đang gửi yêu cầu sinh Auth Ticket từ máy chủ Roblox...{Colors.RESET}")
+        print(f"{Colors.YELLOW}[*] Đang sinh Auth Ticket...{Colors.RESET}")
         ticket, t_msg = RobloxHTTPSAuth.generate_auth_ticket(c)
         if not ticket:
             logger.error("[%s] Không lấy được vé Auth Ticket: %s", target.package, t_msg)
             continue
-        logger.info("[%s] Nhận Auth Ticket thành công: %s... (Độ dài: %d)", target.package, ticket[:15], len(ticket))
+        logger.info("[%s] Nhận Auth Ticket thành công: %s...", target.package, ticket[:15])
 
-        print(f"{Colors.GREEN}[+] Đang gửi vé tham gia và khởi động app...{Colors.RESET}")
+        print(f"{Colors.GREEN}[+] Đang khởi chạy game qua Vé...{Colors.RESET}")
         controller.force_stop(target.package)
+        controller.apply_shared_prefs_cookie(target.package, c)
         time.sleep(0.5)
 
         spec = RobloxLaunchSpec.parse(target.link)
@@ -1456,7 +1468,7 @@ def interactive_menu(
         print(f"│ {Colors.MAGENTA}   2{Colors.RESET}  │ {Colors.CYAN}Nhập Game ID / Link Server VIP                         {Colors.RESET}│")
         print(f"│ {Colors.MAGENTA}   3{Colors.RESET}  │ {Colors.CYAN}Chọn Package Roblox để chạy                            {Colors.RESET}│")
         print(f"│ {Colors.MAGENTA}   4{Colors.RESET}  │ {Colors.CYAN}Mở tất cả App lên nền (Warm-up)                        {Colors.RESET}│")
-        print(f"│ {Colors.MAGENTA}   5{Colors.RESET}  │ {Colors.CYAN}Xác thực Cookie HTTPS & Mở Game qua Vé Auth Ticket     {Colors.RESET}│")
+        print(f"│ {Colors.MAGENTA}   5{Colors.RESET}  │ {Colors.CYAN}Xác thực Cookie cURL & Mở Game qua Vé Auth Ticket      {Colors.RESET}│")
         print(f"│ {Colors.MAGENTA}  13{Colors.RESET}  │ {Colors.GREEN}Cấu hình Nâng cao (Grid / Heartbeat Watchdog)          {Colors.RESET}│")
         print(f"│ {Colors.MAGENTA}   0{Colors.RESET}  │ {Colors.RED}Thoát Hệ Thống                                         {Colors.RESET}│")
         print("└──────┴────────────────────────────────────────────────────────┘")
