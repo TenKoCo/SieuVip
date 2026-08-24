@@ -1446,37 +1446,45 @@ class RejoinEngine:
                 return False
             self.logger.info("[%s] Cookie đăng nhập đã sẵn sàng", target.package)
 
-        lobby_ok, lobby_detail = self.controller.start_lobby(target.package)
-        if lobby_ok:
-            self.logger.debug("[%s] Launcher đã mở", target.package)
-            self._sleep(self.config.warmup_seconds)
-        else:
-            self.logger.warning(
-                "[%s] Không mở được launcher; thử join thẳng: %s",
-                target.package,
-                _compact(lobby_detail),
-            )
-
-        if lobby_ok:
-            if self.controller.backend.can_force_stop:
-                reset_ok, reset_detail = self.controller.force_stop(target.package)
-                if reset_ok:
-                    self.logger.info(
-                        "[%s] Reset xong phiên launcher; chuẩn bị mở lại",
-                        target.package,
-                    )
-                else:
-                    self.logger.warning(
-                        "[%s] Reset launcher thất bại: %s",
-                        target.package,
-                        _compact(reset_detail),
-                    )
-                self._sleep(0.6)
+        # Chỉ làm ấm/reset launcher trong lượt đầu khi bật Auto Rejoin. Những
+        # lần phục hồi sau crash/tắt app đi thẳng vào deep link để mở nhanh hơn.
+        if force_rejoin:
+            lobby_ok, lobby_detail = self.controller.start_lobby(target.package)
+            if lobby_ok:
+                self.logger.debug("[%s] Launcher đã mở", target.package)
+                self._sleep(self.config.warmup_seconds)
             else:
                 self.logger.warning(
-                    "[%s] Bỏ qua reset vì backend không có quyền force-stop",
+                    "[%s] Không mở được launcher; thử join thẳng: %s",
                     target.package,
+                    _compact(lobby_detail),
                 )
+
+            if lobby_ok:
+                if self.controller.backend.can_force_stop:
+                    reset_ok, reset_detail = self.controller.force_stop(target.package)
+                    if reset_ok:
+                        self.logger.info(
+                            "[%s] Reset xong phiên launcher; chuẩn bị mở lại",
+                            target.package,
+                        )
+                    else:
+                        self.logger.warning(
+                            "[%s] Reset launcher thất bại: %s",
+                            target.package,
+                            _compact(reset_detail),
+                        )
+                    self._sleep(0.6)
+                else:
+                    self.logger.warning(
+                        "[%s] Bỏ qua reset vì backend không có quyền force-stop",
+                        target.package,
+                    )
+        else:
+            self.logger.info(
+                "[%s] Recovery rejoin: bỏ qua launcher warm-up",
+                target.package,
+            )
 
         attempts = self.config.retries + 1
         for attempt in range(1, attempts + 1):
