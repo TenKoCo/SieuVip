@@ -17,6 +17,7 @@ from logging.handlers import RotatingFileHandler
 import math
 import os
 from pathlib import Path
+import random
 import re
 import shlex
 import shutil
@@ -24,23 +25,22 @@ import signal
 import subprocess
 import sys
 import time
-import random
 import urllib.parse
 import urllib.error
 import urllib.request
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 try:
-    import fcntl  # Chỉ có trên Linux/Android; luôn tồn tại trong Termux.
-except ImportError:  # Cho phép chạy unit test/parse config trên Windows.
-    fcntl = None  # type: ignore[assignment]
+    import fcntl
+except ImportError:
+    fcntl = None
 
 
 APP_NAME = "sieuvip-rejoin"
-DEFAULT_CONFIG_PATH = Path.home() / ".config" / APP_NAME / "config.json"
-DEFAULT_COOKIE_PATH = Path.home() / ".config" / APP_NAME / "cookies.json"
-DEFAULT_LOG_PATH = Path.home() / ".local" / "state" / APP_NAME / "rejoin.log"
-DEFAULT_LOCK_PATH = Path.home() / ".local" / "state" / APP_NAME / "rejoin.lock"
+DEFAULT_CONFIG_PATH = Path("/sdcard/Download/sieuvip_config.json")
+DEFAULT_COOKIE_PATH = Path("/sdcard/Download/cookies_store.json")
+DEFAULT_LOG_PATH = Path("/sdcard/Download/sieuvip_rejoin.log")
+DEFAULT_LOCK_PATH = Path("/sdcard/Download/sieuvip_rejoin.lock")
 DEFAULT_COOKIE_SOURCE_PATH = Path("/sdcard/Download/cookie.txt")
 DEFAULT_BLOX_FRUITS_PLACE_ID = "2753915549"
 HEALTH_POLL_SECONDS = 5.0
@@ -62,6 +62,17 @@ SYSTEM_COMMANDS = {
     "settings",
     "wm",
 }
+
+
+class Colors:
+    RESET = "\033[0m"
+    BOLD = "\033[1m"
+    CYAN = "\033[36m"
+    MAGENTA = "\033[35m"
+    GREEN = "\033[32m"
+    YELLOW = "\033[33m"
+    RED = "\033[31m"
+    BLUE = "\033[34m"
 
 
 class AppError(RuntimeError):
@@ -166,13 +177,8 @@ class RejoinConfig:
         health_check_method = str(
             raw.get("health_check_method", "online")
         ).strip().lower()
-        
-        if health_check_method in {"intent", "heartbeat"}:
-            health_check_method = "heartbeat_local" if health_check_method == "heartbeat" else "online"
-        if health_check_method not in {"online", "heartbeat_local"}:
-            raise ConfigError(
-                "health_check_method phải là online hoặc heartbeat_local"
-            )
+        if health_check_method not in {"online", "heartbeat"}:
+            health_check_method = "online"
 
         config = cls(
             targets=targets,
@@ -245,7 +251,7 @@ def load_config(path: Path) -> RejoinConfig:
             raw = json.load(file)
     except FileNotFoundError as exc:
         raise ConfigError(
-            f"Không thấy config {path}. Hãy chạy lệnh init trước."
+            f"Không thấy config {path}. Hãy chạy thiết lập package trước."
         ) from exc
     except (OSError, json.JSONDecodeError) as exc:
         raise ConfigError(f"Không đọc được config {path}: {exc}") from exc
@@ -282,19 +288,22 @@ def setup_logger(log_path: Path, verbose: bool = False) -> logging.Logger:
     console.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%H:%M:%S"))
     logger.addHandler(console)
 
-    rotating = RotatingFileHandler(
-        log_path,
-        maxBytes=2 * 1024 * 1024,
-        backupCount=3,
-        encoding="utf-8",
-    )
-    rotating.setLevel(logging.DEBUG)
-    rotating.setFormatter(
-        logging.Formatter(
-            "%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S"
+    try:
+        rotating = RotatingFileHandler(
+            log_path,
+            maxBytes=2 * 1024 * 1024,
+            backupCount=3,
+            encoding="utf-8",
         )
-    )
-    logger.addHandler(rotating)
+        rotating.setLevel(logging.DEBUG)
+        rotating.setFormatter(
+            logging.Formatter(
+                "%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S"
+            )
+        )
+        logger.addHandler(rotating)
+    except OSError:
+        pass
     return logger
 
 
@@ -338,21 +347,14 @@ class WakeLock:
         if not self.enabled:
             return self
         if not command:
-            self.logger.warning(
-                "Không thấy termux-wake-lock; nên cài package termux-api và tắt tối ưu pin cho Termux"
-            )
             return self
         try:
             result = subprocess.run(
                 [command], capture_output=True, text=True, timeout=8, check=False
             )
             self.acquired = result.returncode == 0
-            if self.acquired:
-                self.logger.info("Đã giữ wake-lock cho Termux")
-            else:
-                self.logger.warning("Không lấy được wake-lock: %s", _compact(result.stderr))
-        except (OSError, subprocess.SubprocessError) as exc:
-            self.logger.warning("Không lấy được wake-lock: %s", exc)
+        except (OSError, subprocess.SubprocessError):
+            pass
         return self
 
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
@@ -363,7 +365,6 @@ class WakeLock:
             subprocess.run(
                 [command], capture_output=True, text=True, timeout=8, check=False
             )
-            self.logger.info("Đã nhả wake-lock")
 
 
 class AndroidBackend:
@@ -404,7 +405,7 @@ class AndroidBackend:
             return f"root qua {self.su_path}"
         if self.kind == "adb":
             return f"adb shell ({self.adb_serial or 'auto'})"
-        return "Termux soft mode (không force-stop)"
+        return "Termux soft mode"
 
     def run(
         self,
@@ -450,8 +451,6 @@ class AndroidBackend:
                 if isinstance(value, bytes):
                     value = value.decode("utf-8", errors="replace")
                 decoded_parts.append(str(value).strip() if value else "")
-            stdout = decoded_parts[0]
-            stderr = decoded_parts[1]
             return CommandResult(
                 argv=logical_argv,
                 returncode=124,
@@ -459,8 +458,8 @@ class AndroidBackend:
                 or f"Timeout sau {timeout:.1f}s",
                 elapsed=time.monotonic() - started,
                 timed_out=True,
-                stdout=stdout,
-                stderr=stderr,
+                stdout=decoded_parts[0],
+                stderr=decoded_parts[1],
             )
         except OSError as exc:
             return CommandResult(
@@ -544,10 +543,6 @@ def select_backend(requested: str, adb_serial: Optional[str]) -> AndroidBackend:
             serial = _select_adb_device(adb_path, adb_serial)
             if serial:
                 return AndroidBackend("adb", adb_path=adb_path, adb_serial=serial)
-        if requested == "adb":
-            raise BackendError(
-                "Không có adb device. Hãy adb pair/connect trước hoặc truyền --adb-serial."
-            )
 
     am_path = shutil.which("am")
     if requested in {"auto", "soft"} and (am_path or Path("/system/bin/am").exists()):
@@ -766,27 +761,6 @@ class CookieStore:
             raise ConfigError(f"Không tìm thấy cookie hợp lệ trong {path}")
         return mapping
 
-    @staticmethod
-    def save_private(path: Path, mapping: Dict[str, str]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(path.name + ".tmp")
-        payload = {"cookies": mapping}
-        try:
-            with temporary.open("w", encoding="utf-8") as file:
-                json.dump(payload, file, ensure_ascii=False, indent=2)
-                file.write("\n")
-                file.flush()
-                os.fsync(file.fileno())
-            os.chmod(temporary, 0o600)
-            os.replace(temporary, path)
-            os.chmod(path, 0o600)
-        except OSError as exc:
-            try:
-                temporary.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise ConfigError(f"Không lưu được kho cookie {path}: {exc}") from exc
-
 
 def validate_roblox_cookie(cookie: str, timeout: float = 10.0) -> Tuple[bool, str]:
     try:
@@ -820,25 +794,8 @@ def validate_roblox_cookie(cookie: str, timeout: float = 10.0) -> Tuple[bool, st
     return True, f"Cookie hợp lệ cho tài khoản {masked}"
 
 
-def harden_cookie_file(path: Path, logger: logging.Logger) -> None:
-    try:
-        os.chmod(path, 0o600)
-        mode = path.stat().st_mode & 0o777
-    except OSError as exc:
-        logger.warning("Không đặt được quyền 600 cho file cookie: %s", exc)
-        return
-    if mode & 0o077:
-        logger.warning(
-            "File cookie vẫn có quyền %03o; hãy chuyển nó vào vùng private của Termux",
-            mode,
-        )
-
-
 class CookieInstaller:
-    """Uses robust sed method to inject cookies without breaking the preferences XML."""
-    
     PREF_NAME = "com.roblox.client_preferences.xml"
-    SESSION_KEY = "RBXSession"
 
     def __init__(
         self,
@@ -852,19 +809,19 @@ class CookieInstaller:
 
     def apply(self, package: str, cookie: str) -> Tuple[bool, str]:
         if not self.backend.can_write_app_data:
-            return False, "Inject cookie cần backend root/su, ADB shell không đủ quyền"
+            return False, "Inject cookie cần backend root/su"
         if not PACKAGE_RE.fullmatch(package):
             return False, "Package không hợp lệ"
         try:
             normalized = CookieStore.normalize(cookie)
         except ConfigError as exc:
             return False, str(exc)
-            
+
         c = normalized
         if not c.startswith("_|WARNING:-DO-NOT-SHARE-THIS"):
             c = "_|WARNING:-DO-NOT-SHARE-THIS.--Sharing-this-will-allow-someone-to-log-into-your-account-and-rob-your-robox.--|_" + c
 
-        xml_path = f"/data/data/{package}/shared_prefs/com.roblox.client_preferences.xml"
+        xml_path = f"/data/data/{package}/shared_prefs/{self.PREF_NAME}"
         cmd = (
             f"mkdir -p /data/data/{package}/shared_prefs && "
             f"if [ ! -f '{xml_path}' ]; then "
@@ -877,17 +834,10 @@ class CookieInstaller:
             f"fi; "
             f"fi && chmod 660 '{xml_path}' && chown $(stat -c '%u:%g' /data/data/{package}) '{xml_path}'"
         )
-        
-        write_result = self.backend.run(
-            ["sh", "-c", cmd],
-            timeout=self.command_timeout,
-        )
-        
+        write_result = self.backend.run(["sh", "-c", cmd], timeout=self.command_timeout)
         if not write_result.ok:
-            return False, "Không ghi được SharedPreferences: " + _compact(
-                write_result.stderr or write_result.output
-            )
-        return True, "Đã ghi RBXSession vào XML thành công (chưa xác minh đăng nhập app)"
+            return False, f"Không ghi được cookie qua sed: {_compact(write_result.output)}"
+        return True, "Đã ghi RBXSession vào XML thành công"
 
 
 class AndroidController:
@@ -919,9 +869,7 @@ class AndroidController:
         return result.ok and not any(marker in lowered for marker in cls.FAILURE_MARKERS)
 
     def preflight(self) -> Tuple[bool, str]:
-        current_user = self.backend.run(
-            ["am", "get-current-user"], timeout=12
-        )
+        current_user = self.backend.run(["am", "get-current-user"], timeout=12)
         if self.command_accepted(current_user) and re.search(
             r"(?m)^\s*\d+\s*$", current_user.stdout or current_user.output
         ):
@@ -944,8 +892,7 @@ class AndroidController:
         )
         if help_is_valid:
             return True, help_result.output
-        detail = current_user.output or help_result.output
-        return False, detail
+        return False, current_user.output or help_result.output
 
     def force_stop(self, package: str) -> Tuple[bool, str]:
         if not self.backend.can_force_stop:
@@ -1022,12 +969,6 @@ class AndroidController:
                 )
                 for argv in intents:
                     result = self.backend.run(argv, timeout=self.command_timeout)
-                    self.logger.debug(
-                        "am result rc=%s elapsed=%.2fs output=%s",
-                        result.returncode,
-                        result.elapsed,
-                        _compact(result.output),
-                    )
                     if self.command_accepted(result):
                         return True, result.output or "Android đã nhận intent"
                     errors.append(result.output or f"rc={result.returncode}")
@@ -1044,14 +985,6 @@ class AndroidController:
                 if PACKAGE_RE.fullmatch(package):
                     packages.append(package)
         return sorted(set(packages)), ""
-
-    def package_exists(self, package: str) -> Tuple[Optional[bool], str]:
-        result = self.backend.run(["pm", "path", package], timeout=15)
-        if self.command_accepted(result):
-            return result.output.startswith("package:"), result.output
-        if not self.backend.can_inspect_all_packages:
-            return None, result.output
-        return False, result.output
 
     def is_process_running(self, package: str) -> Tuple[bool, str]:
         process_result = self.backend.run(["pidof", package], timeout=10)
@@ -1083,18 +1016,18 @@ class AndroidController:
         )
         if task_running:
             return True, process_result.output
-        return False, "PID còn tồn tại nhưng không còn Activity/task Roblox"
+        return False, "PID còn tồn tại nhưng không còn Activity Roblox"
 
     def get_screen_size(self) -> Tuple[int, int]:
         result = self.backend.run(["wm", "size"], timeout=10)
         matches = re.findall(r"(?i)(\d+)x(\d+)", result.output)
         if matches:
-            return tuple(map(int, matches[-1]))  # type: ignore[return-value]
+            return tuple(map(int, matches[-1]))
         return 720, 1280
 
     def randomize_android_id(self) -> Tuple[bool, str]:
         if not self.backend.can_write_secure_settings:
-            return False, "backend hiện tại không cho phép ghi secure settings"
+            return False, "backend không cho phép ghi secure settings"
         value = os.urandom(8).hex()
         result = self.backend.run(
             ["settings", "put", "secure", "android_id", value], timeout=15
@@ -1122,24 +1055,25 @@ class RejoinEngine:
     def request_stop(self, signum: int, frame: Any) -> None:
         del frame
         if not self.stop_requested:
-            self.logger.info("Nhận signal %s; sẽ dừng an toàn...", signum)
+            self.logger.info("Nhận signal %s; dừng an toàn...", signum)
         self.stop_requested = True
 
-    def _inject_ping_script(self) -> None:
-        check_filename = f"{random.randint(100000, 999999)}.main"
-        lua_code = f"""spawn(function()
-    while task.wait(30) do
-        pcall(function()
-            writefile("{check_filename}", tostring(os.time()))
-        end)
-    end
-end)"""
-        temp_file = "/sdcard/Download/sv_ping_temp.lua"
+    def _inject_ping_script_silently(self) -> None:
+        check_file = f"{random.randint(100000, 999999)}.main"
+        lua_code = (
+            "spawn(function()\n"
+            "    while task.wait(30) do\n"
+            "        pcall(function()\n"
+            f'            writefile("{check_file}", tostring(os.time()))\n'
+            "        end)\n"
+            "    end\n"
+            "end)"
+        )
+        temp_file = "/sdcard/Download/sv_tmp_ping.lua"
         try:
             with open(temp_file, "w", encoding="utf-8") as f:
                 f.write(lua_code)
-        except Exception as e:
-            self.logger.warning("Không tạo được file tạm để inject script Lua: %s", e)
+        except Exception:
             return
 
         target_dirs = [
@@ -1148,62 +1082,47 @@ end)"""
             "/sdcard/Codex/autoexecute",
             "/sdcard/spdm/autoexecute",
             "/sdcard/Hydrogen/autoexecute",
-            "/sdcard/Trigon/autoexecute"
+            "/sdcard/Trigon/autoexecute",
         ]
-
         for target in target_dirs:
             check_cmd = f"[ -d {target} ] && echo EXISTS"
             res = self.controller.backend.run(["sh", "-c", check_cmd], timeout=5)
             if "EXISTS" in res.output:
                 self.controller.backend.run(["sh", "-c", f"rm -f {target}/SieuVip_Ping_*.lua"], timeout=5)
-                dest_file = f"{target}/SieuVip_Ping_{random.randint(10,99)}.lua"
-                copy_cmd = f"cp {temp_file} {dest_file} && chmod 777 {dest_file}"
-                self.controller.backend.run(["sh", "-c", copy_cmd], timeout=5)
-                
+                dest = f"{target}/SieuVip_Ping_{random.randint(10,99)}.lua"
+                self.controller.backend.run(["sh", "-c", f"cp {temp_file} {dest} && chmod 777 {dest}"], timeout=5)
+
         self.controller.backend.run(["sh", "-c", f"rm -f {temp_file}"], timeout=5)
-        self.logger.info("Đã tiêm script giám sát heartbeat (.main) ngẫu nhiên vào các Executor")
 
-    def _get_local_heartbeat(self, target: TargetConfig) -> Tuple[Optional[float], str]:
-        ping_path = self._ping_paths.get(target.package)
-        if not ping_path:
-            find_cmd = f"find /sdcard/Android/data/{target.package} -name '*.main' -type f 2>/dev/null | head -n 1"
-            res = self.controller.backend.run(["sh", "-c", find_cmd], timeout=15)
+    def _read_local_heartbeat(self, package: str) -> Tuple[Optional[float], str]:
+        path = self._ping_paths.get(package)
+        if not path:
+            find_cmd = f"find /sdcard/Android/data/{package} -name '*.main' -type f 2>/dev/null | head -n 1"
+            res = self.controller.backend.run(["sh", "-c", find_cmd], timeout=10)
             if res.ok and res.stdout.strip():
-                ping_path = res.stdout.strip()
-                self._ping_paths[target.package] = ping_path
+                path = res.stdout.strip()
+                self._ping_paths[package] = path
 
-        if ping_path:
-            stat_cmd = f"stat -c %Y {shlex.quote(ping_path)}"
-            res = self.controller.backend.run(["sh", "-c", stat_cmd], timeout=10)
+        if path:
+            res = self.controller.backend.run(["sh", "-c", f"stat -c %Y {shlex.quote(path)}"], timeout=8)
             if res.ok and res.stdout.strip().isdigit():
                 return float(res.stdout.strip()), "OK"
-            else:
-                return None, "Không đọc được thông tin file ping (hoặc file bị xóa)"
-        return None, "Không tìm thấy file ping *.main"
+            return None, "File heartbeat không phản hồi"
+        return None, "Chưa tìm thấy file .main"
 
     def run(self, once: bool = False) -> int:
         enabled = [target for target in self.config.targets if target.enabled]
         if not enabled:
-            raise ConfigError("Không có target nào đang enabled")
+            raise ConfigError("Không có package nào đang được bật")
 
         ok, detail = self.controller.preflight()
         if not ok:
             raise BackendError(
-                "Backend không chạy được Android Activity Manager: " + _compact(detail)
+                "Backend không chạy được Activity Manager: " + _compact(detail)
             )
-        if not self.controller.backend.can_force_stop:
-            self.logger.warning(
-                "Đang chạy soft mode: chỉ gửi deep link, không force-stop. "
-                "Muốn ổn định hãy dùng --backend su hoặc --backend adb."
-            )
-        if self.config.auto_login_cookies:
-            if not self.controller.backend.can_write_app_data:
-                raise BackendError("Auto-login cookie cần backend root/su")
-            if self.cookie_installer is None:
-                raise ConfigError("Auto-login đã bật nhưng chưa nạp kho cookie")
 
-        if self.config.health_check_method == "heartbeat_local":
-            self._inject_ping_script()
+        if self.config.health_check_method == "heartbeat":
+            self._inject_ping_script_silently()
 
         signal.signal(signal.SIGINT, self.request_stop)
         signal.signal(signal.SIGTERM, self.request_stop)
@@ -1211,36 +1130,26 @@ end)"""
         while not self.stop_requested:
             cycle += 1
             started = time.monotonic()
-            monitor_mode = True
-            cycle_logger = self.logger.debug if monitor_mode else self.logger.info
-            cycle_logger("========== Bắt đầu chu kỳ %d =========", cycle)
+            self.logger.info("========== Chu kỳ %d ==========", cycle)
 
             if self.config.randomize_android_id_each_cycle:
                 changed, change_detail = self.controller.randomize_android_id()
                 if changed:
-                    self.logger.info("Đã đổi Android ID cho chu kỳ %d", cycle)
-                else:
-                    self.logger.warning(
-                        "Không đổi được Android ID: %s", _compact(change_detail)
-                    )
+                    self.logger.info("Đã đổi Android ID ngẫu nhiên cho chu kỳ %d", cycle)
 
             bounds = self._resolve_bounds(enabled)
             succeeded = 0
             for index, target in enumerate(enabled):
                 if self.stop_requested:
                     break
-                if self._run_target(
-                    target,
-                    bounds[index],
-                    force_rejoin=(cycle == 1),
-                ):
+                if self._run_target(target, bounds[index], force_rejoin=(cycle == 1)):
                     succeeded += 1
                 if index + 1 < len(enabled):
                     self._sleep(self.config.between_apps_seconds)
 
             elapsed = time.monotonic() - started
-            cycle_logger(
-                "Chu kỳ %d hoàn tất: %d/%d package ổn định, thời gian %.1fs",
+            self.logger.info(
+                "Chu kỳ %d hoàn tất: %d/%d app ổn định (%.1fs)",
                 cycle,
                 succeeded,
                 len(enabled),
@@ -1248,19 +1157,15 @@ end)"""
             )
             if once or self.stop_requested:
                 break
-            if monitor_mode:
-                wait_seconds = (
-                    HEALTH_POLL_SECONDS
-                    if self.config.interval_seconds <= 0
-                    else min(self.config.interval_seconds, HEALTH_POLL_SECONDS)
-                )
-                self._sleep(wait_seconds)
-            else:
-                if self.config.interval_seconds <= 0:
-                    break
-                wait_seconds = self.config.interval_seconds
-                self._wait_for_next_cycle(wait_seconds)
-        self.logger.info("Auto rejoin đã dừng")
+
+            wait_limit = (
+                HEALTH_POLL_SECONDS
+                if self.config.interval_seconds <= 0
+                else min(self.config.interval_seconds, HEALTH_POLL_SECONDS)
+            )
+            self._sleep(wait_limit)
+
+        self.logger.info("Engine đã dừng.")
         return 0
 
     def _run_target(
@@ -1272,107 +1177,31 @@ end)"""
     ) -> bool:
         spec = RobloxLaunchSpec.parse(target.link)
         if not spec.is_valid():
-            self.logger.error("[%s] Link/Place ID không hợp lệ", target.package)
-            return False
-
-        exists, package_detail = self.controller.package_exists(target.package)
-        if exists is False:
-            self.logger.error(
-                "[%s] Package không tồn tại: %s",
-                target.package,
-                _compact(package_detail),
-            )
+            self.logger.error("[%s] Link không hợp lệ", target.package)
             return False
 
         if not force_rejoin:
             healthy, health_detail = self._target_health_once(target)
             if healthy:
-                self.logger.debug(
-                    "[%s] %s còn hợp lệ; giữ nguyên phiên",
-                    target.package,
-                    self._health_method_label(),
-                )
                 return True
-            self.logger.info(
-                "[%s] %s không hợp lệ; bắt đầu rejoin (%s)",
-                target.package,
-                self._health_method_label(),
-                _compact(health_detail),
-            )
-        else:
-            self.logger.info(
-                "[%s] Lượt đầu: bắt buộc reset và rejoin",
-                target.package,
-            )
+            self.logger.info("[%s] Phát hiện mất kết nối/kẹt (%s) -> Rejoin", target.package, health_detail)
 
-        self.logger.info("[%s] Chuẩn bị rejoin", target.package)
         if self.controller.backend.can_force_stop:
-            stopped, stop_detail = self.controller.force_stop(target.package)
-            if not stopped:
-                self.logger.warning(
-                    "[%s] force-stop thất bại: %s",
-                    target.package,
-                    _compact(stop_detail),
-                )
-            self._sleep(0.6)
+            self.controller.force_stop(target.package)
+            self._sleep(0.5)
 
         if self.config.auto_login_cookies:
             cookie = self.cookies.get(target.package)
-            if not cookie:
-                self.logger.error(
-                    "[%s] Không có cookie tương ứng trong kho cookie", target.package
-                )
-                return False
-            assert self.cookie_installer is not None
-            installed, install_detail = self.cookie_installer.apply(
-                target.package, cookie
-            )
-            if not installed:
-                self.logger.error(
-                    "[%s] Auto-login cookie thất bại: %s",
-                    target.package,
-                    _compact(install_detail),
-                )
-                return False
-            self.logger.info("[%s] Cookie đăng nhập đã sẵn sàng", target.package)
+            if cookie and self.cookie_installer:
+                self.cookie_installer.apply(target.package, cookie)
 
         if force_rejoin:
-            lobby_ok, lobby_detail = self.controller.start_lobby(target.package)
-            if lobby_ok:
-                self.logger.debug("[%s] Launcher đã mở", target.package)
+            opened, _ = self.controller.start_lobby(target.package)
+            if opened:
                 self._sleep(self.config.warmup_seconds)
-            else:
-                self.logger.warning(
-                    "[%s] Không mở được launcher; thử join thẳng: %s",
-                    target.package,
-                    _compact(lobby_detail),
-                )
-
-            if lobby_ok:
                 if self.controller.backend.can_force_stop:
-                    reset_ok, reset_detail = self.controller.force_stop(target.package)
-                    if reset_ok:
-                        self.logger.info(
-                            "[%s] Reset xong phiên launcher; chuẩn bị mở lại",
-                            target.package,
-                        )
-                    else:
-                        self.logger.warning(
-                            "[%s] Reset launcher thất bại: %s",
-                            target.package,
-                            _compact(reset_detail),
-                        )
-                    self._sleep(0.6)
-                else:
-                    self.logger.warning(
-                        "[%s] Bỏ qua reset vì backend không có quyền force-stop",
-                        target.package,
-                    )
-        else:
-            self.logger.info(
-                "[%s] Recovery rejoin: bỏ qua launcher warm-up",
-                target.package,
-            )
+                    self.controller.force_stop(target.package)
+                    self._sleep(0.5)
 
         attempts = self.config.retries + 1
         for attempt in range(1, attempts + 1):
@@ -1380,7 +1209,7 @@ end)"""
                 return False
             if attempt > 1 and self.controller.backend.can_force_stop:
                 self.controller.force_stop(target.package)
-                self._sleep(0.6)
+                self._sleep(0.5)
 
             join_started = time.time()
             accepted, detail = self.controller.start_deep_link(
@@ -1390,93 +1219,53 @@ end)"""
                 bounds=bounds,
             )
             if accepted:
-                healthy, health_detail = self._wait_for_target_health(
-                    target, join_started
-                )
+                healthy, health_detail = self._wait_for_target_health(target, join_started)
                 if healthy:
-                    self.logger.info(
-                        "[%s] Rejoin thành công theo %s (lần %d/%d)",
-                        target.package,
-                        self._health_method_label(),
-                        attempt,
-                        attempts,
-                    )
+                    self.logger.info("[%s] Join thành công (Lần %d/%d)", target.package, attempt, attempts)
                     return True
-                detail = (
-                    "Android đã nhận intent nhưng "
-                    f"{self._health_method_label()} không xác nhận: {health_detail}"
-                )
+                detail = health_detail
 
-            self.logger.warning(
-                "[%s] Join lần %d/%d thất bại: %s",
-                target.package,
-                attempt,
-                attempts,
-                _compact(detail),
-            )
+            self.logger.warning("[%s] Join lần %d thất bại: %s", target.package, attempt, _compact(detail))
             if attempt < attempts:
-                delay = self.config.retry_backoff_seconds * (2 ** (attempt - 1))
-                self._sleep(delay)
+                self._sleep(self.config.retry_backoff_seconds * attempt)
         return False
-
-    def _health_method_label(self) -> str:
-        return {
-            "online": "Check Online (Tiến trình)",
-            "heartbeat_local": "Check Executor (Local File .main)",
-        }.get(self.config.health_check_method, "Check Online")
 
     def _target_health_once(
         self,
         target: TargetConfig,
         not_before: Optional[float] = None,
     ) -> Tuple[bool, str]:
-        method = self.config.health_check_method
-        if method == "online":
+        if self.config.health_check_method == "online":
             running, detail = self.controller.is_process_running(target.package)
-            return (
-                (True, "Tiến trình Android đang chạy")
-                if running
-                else (False, _compact(detail) or "Không thấy tiến trình Android")
-            )
-        if method != "heartbeat_local":
-            return False, f"Method check không hợp lệ: {method}"
+            return (True, "Running") if running else (False, detail)
 
-        timestamp, detail = self._get_local_heartbeat(target)
+        timestamp, detail = self._read_local_heartbeat(target.package)
         if timestamp is None:
             return False, detail
         now = time.time()
-        if timestamp > now + 60:
-            return False, "Timestamp heartbeat nằm quá xa trong tương lai"
         age = max(0.0, now - timestamp)
         if age > self.config.health_check_timeout_seconds:
             old_path = self._ping_paths.get(target.package)
             if old_path:
                 self.controller.backend.run(["sh", "-c", f"rm -f {shlex.quote(old_path)}"])
                 del self._ping_paths[target.package]
-            return False, f"Heartbeat đã cũ {age:.0f}s"
-        if not_before is not None and timestamp < not_before - 5:
-            return False, "Heartbeat chưa cập nhật sau lần mở app này"
-        return True, f"Heartbeat mới {age:.0f}s"
+            return False, f"Heartbeat đóng băng {age:.0f}s"
+        return True, "Heartbeat active"
 
     def _wait_for_target_health(
         self,
         target: TargetConfig,
         join_started: float,
     ) -> Tuple[bool, str]:
-        deadline = time.monotonic() + max(
-            0, self.config.health_check_timeout_seconds
-        )
+        deadline = time.monotonic() + max(0, self.config.health_check_timeout_seconds)
         last_detail = "Chưa có tín hiệu"
         while not self.stop_requested:
-            healthy, last_detail = self._target_health_once(
-                target, not_before=join_started
-            )
+            healthy, last_detail = self._target_health_once(target, not_before=join_started)
             if healthy:
                 return True, last_detail
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
+            if time.monotonic() >= deadline:
                 break
-            self._sleep(min(HEALTH_POLL_SECONDS, remaining))
+            self._sleep(HEALTH_POLL_SECONDS)
         return False, last_detail
 
     def _resolve_bounds(self, targets: List[TargetConfig]) -> List[Optional[str]]:
@@ -1486,9 +1275,7 @@ end)"""
 
         width, height = self.controller.get_screen_size()
         count = max(1, len(targets))
-        minimum_window_width = 220
-        maximum_columns = max(1, min(6, width // minimum_window_width))
-        columns = min(count, maximum_columns)
+        columns = min(count, max(1, min(6, width // 220)))
         rows = math.ceil(len(targets) / columns)
         cell_width = width // columns
         cell_height = height // max(1, rows)
@@ -1498,51 +1285,31 @@ end)"""
 
         if not self.config.auto_arrange:
             window_height = min(height - (margin * 2), preferred_height)
-            max_left = max(0, width - responsive_width - margin)
-            max_top = max(0, height - window_height - margin)
             cascade = max(18, width // 50)
-            sorted_bounds: List[Optional[str]] = []
+            sorted_bounds = []
             for index, target in enumerate(targets):
                 if target.bounds:
                     sorted_bounds.append(target.bounds)
                     continue
-                left = margin + min(max_left, index * cascade)
-                top = margin + min(max_top, index * cascade)
+                left = margin + min(max(0, width - responsive_width - margin), index * cascade)
+                top = margin + min(max(0, height - window_height - margin), index * cascade)
                 right = min(width, left + responsive_width)
                 bottom = min(height, top + window_height)
                 sorted_bounds.append(f"{left},{top},{right},{bottom}")
             return sorted_bounds
 
-        result: List[Optional[str]] = []
+        result = []
         for index, target in enumerate(targets):
             if target.bounds:
                 result.append(target.bounds)
                 continue
-            column = index % columns
-            row = index // columns
-            cell_left = column * cell_width
-            cell_top = row * cell_height
-            cell_right = width if column == columns - 1 else cell_left + cell_width
-            cell_bottom = height if row == rows - 1 else cell_top + cell_height
-            left = cell_left + margin
-            top = cell_top + margin
-            right = max(left + 1, cell_right - margin)
-            bottom = min(cell_bottom - margin, top + preferred_height)
-            if bottom <= top:
-                bottom = min(height, top + 1)
+            col, row = index % columns, index // columns
+            left = (col * cell_width) + margin
+            top = (row * cell_height) + margin
+            right = ((col + 1) * cell_width if col < columns - 1 else width) - margin
+            bottom = min(((row + 1) * cell_height if row < rows - 1 else height) - margin, top + preferred_height)
             result.append(f"{left},{top},{right},{bottom}")
         return result
-
-    def _wait_for_next_cycle(self, seconds: int) -> None:
-        deadline = time.monotonic() + seconds
-        while not self.stop_requested:
-            remaining = math.ceil(deadline - time.monotonic())
-            if remaining <= 0:
-                return
-            if remaining == seconds or remaining <= 10 or remaining % 60 == 0:
-                minutes, secs = divmod(remaining, 60)
-                self.logger.info("Chu kỳ tiếp theo sau %02d:%02d", minutes, secs)
-            self._sleep(min(1.0, remaining))
 
     def _sleep(self, seconds: float) -> None:
         deadline = time.monotonic() + max(0.0, seconds)
@@ -1555,9 +1322,7 @@ end)"""
 
 def _compact(value: str, limit: int = 300) -> str:
     compact = " ".join(str(value).split())
-    if len(compact) <= limit:
-        return compact
-    return compact[: limit - 1] + "…"
+    return compact if len(compact) <= limit else compact[:limit - 1] + "…"
 
 
 def _parse_selection(raw: str, matches: List[str]) -> List[str]:
@@ -1571,381 +1336,50 @@ def _parse_selection(raw: str, matches: List[str]) -> List[str]:
             selected.append(matches[int(item) - 1])
         elif PACKAGE_RE.fullmatch(item):
             selected.append(item)
-        elif item:
-            raise ConfigError(f"Lựa chọn/package không hợp lệ: {item}")
     return list(dict.fromkeys(selected))
 
 
-def init_config(
-    path: Path,
-    backend: AndroidBackend,
-    logger: logging.Logger,
-    force: bool,
-) -> int:
-    if path.exists() and not force:
-        answer = input(f"Config {path} đã tồn tại. Ghi đè? [y/N]: ").strip().lower()
-        if answer not in {"y", "yes"}:
-            print("Đã huỷ.")
-            return 0
-
-    controller = AndroidController(backend, logger, 25)
-    packages, error = controller.list_packages()
-    matches = [
-        package
-        for package in packages
-        if "roblox" in package.lower() or "clone" in package.lower()
-    ]
-    if matches:
-        print("\nPackage có thể là Roblox:")
-        for index, package in enumerate(matches, start=1):
-            print(f"  {index:>2}. {package}")
-        raw_selection = input(
-            "Chọn số cách nhau bằng dấu phẩy, 'all', hoặc nhập package đầy đủ: "
-        )
-        selected = _parse_selection(raw_selection, matches)
-    else:
-        if error:
-            print("Không quét được package:", _compact(error))
-        raw_selection = input("Nhập package, nhiều package cách nhau bằng dấu phẩy: ")
-        selected = _parse_selection(raw_selection, [])
-    if not selected:
-        raise ConfigError("Bạn chưa chọn package nào")
-
-    link = input("Server link / Place ID áp dụng cho các package: ").strip()
-    spec = RobloxLaunchSpec.parse(link)
-    if not spec.is_valid():
-        raise ConfigError("Server link / Place ID không hợp lệ")
-
-    interval_raw = input("Thời gian giữa hai chu kỳ, phút [15; 0 = chạy một lần]: ").strip()
-    interval_seconds = int(float(interval_raw or "15") * 60)
-    warmup_raw = input("Thời gian warm-up launcher, giây [2.5]: ").strip()
-    warmup = float(warmup_raw or "2.5")
-    auto_login_answer = input(
-        "Tự inject cookie trước khi mở từng app? [y/N]: "
-    ).strip().lower()
-    auto_login = auto_login_answer in {"y", "yes"}
-
-    config = RejoinConfig(
-        targets=[TargetConfig(package=package, link=link) for package in selected],
-        interval_seconds=max(0, interval_seconds),
-        warmup_seconds=max(0, min(60, warmup)),
-        auto_login_cookies=auto_login,
-    )
-    save_config(path, config)
-    print(f"\nĐã lưu config: {path}")
-    if auto_login:
-        print(
-            "Hãy import cookie bằng: "
-            "python sieuvip.py import-cookies /đường/dẫn/cookie.txt"
-        )
-    print("Kiểm tra bằng lệnh: python sieuvip.py check")
-    return 0
-
-
-def run_check(
-    config: RejoinConfig,
-    controller: AndroidController,
-    backend: AndroidBackend,
-    cookie_path: Path,
-    logger: logging.Logger,
-) -> int:
-    print(f"Backend: {backend.description}")
-    print(f"Force-stop: {'có' if backend.can_force_stop else 'không'}")
-    am_ok, am_detail = controller.preflight()
-    print(f"Android Activity Manager: {'OK' if am_ok else 'LỖI'}")
-    if not am_ok:
-        print("  ", _compact(am_detail))
-
-    all_ok = am_ok
-    for target in config.targets:
-        spec = RobloxLaunchSpec.parse(target.link)
-        exists, detail = controller.package_exists(target.package)
-        package_status = "OK" if exists is True else (
-            "không xác minh được" if exists is None else "KHÔNG TỒN TẠI"
-        )
-        link_status = "OK" if spec.is_valid() else "LỖI"
-        print(f"- {target.package}: package={package_status}, link={link_status}")
-        if spec.is_valid():
-            print(f"  deep link ưu tiên: {spec.candidate_urls()[0]}")
-        if exists is False:
-            print("  ", _compact(detail))
-            all_ok = False
-        all_ok = all_ok and spec.is_valid()
-
-    if backend.kind == "soft":
-        print(
-            "CẢNH BÁO: soft mode không force-stop và có thể bị Android 14+ chặn. "
-            "Dùng backend su hoặc adb để chạy ổn định."
-        )
-    if config.auto_login_cookies:
-        print(f"Auto-login cookie: bật ({cookie_path})")
-        if not backend.can_write_app_data:
-            print("  LỖI: inject cookie cần backend root/su")
-            all_ok = False
-        else:
-            try:
-                packages = [target.package for target in config.targets if target.enabled]
-                cookies = CookieStore.load(cookie_path, packages)
-                harden_cookie_file(cookie_path, logger)
-                for package in packages:
-                    status = "OK" if package in cookies else "THIẾU"
-                    print(f"  {package}: cookie={status}")
-                    all_ok = all_ok and package in cookies
-            except ConfigError as exc:
-                print(f"  LỖI: {exc}")
-                all_ok = False
-    return 0 if all_ok else 2
-
-
-def import_cookies(
-    config: RejoinConfig,
-    source: Path,
-    destination: Path,
-) -> int:
-    packages = [target.package for target in config.targets if target.enabled]
-    mapping = CookieStore.load(source, packages)
-    CookieStore.save_private(destination, mapping)
-    print(f"Đã import {len(mapping)} cookie vào: {destination}")
-    print("Cookie được lưu với quyền 600; giá trị cookie không được in ra màn hình.")
-    missing = [package for package in packages if package not in mapping]
-    if missing:
-        print("Package còn thiếu cookie:")
-        for package in missing:
-            print(f"  - {package}")
-        return 2
-    return 0
-
-
-def login_cookies(
-    config: RejoinConfig,
-    controller: AndroidController,
-    backend: AndroidBackend,
-    cookie_path: Path,
-    logger: logging.Logger,
-    selected_packages: Optional[Sequence[str]] = None,
-) -> int:
-    if not backend.can_write_app_data:
-        raise BackendError("Đăng nhập cookie cần backend root/su")
-    all_targets = [target for target in config.targets if target.enabled]
-    if not all_targets:
-        raise ConfigError("Chưa chọn package. Hãy dùng chức năng 3 trước.")
-    all_packages = [target.package for target in all_targets]
-    cookies = CookieStore.load(cookie_path, all_packages)
-    if selected_packages is None:
-        targets = all_targets
-    else:
-        requested = set(selected_packages)
-        unknown = requested.difference(all_packages)
-        if unknown:
-            raise ConfigError(
-                "Package được chọn không có trong chức năng 3: "
-                + ", ".join(sorted(unknown))
-            )
-        targets = [
-            target for target in all_targets if target.package in requested
-        ]
-        if not targets:
-            raise ConfigError("Bạn chưa chọn package để đăng nhập")
-    harden_cookie_file(cookie_path, logger)
-    installer = CookieInstaller(backend, logger, config.command_timeout_seconds)
-    succeeded = 0
-    for target in targets:
-        cookie = cookies.get(target.package)
-        if not cookie:
-            logger.warning(
-                "Đã hết cookie; dừng trước package %s", target.package
-            )
-            break
-        valid, validation_detail = validate_roblox_cookie(cookie)
-        if not valid:
-            logger.error(
-                "[%s] Không dùng cookie: %s",
-                target.package,
-                _compact(validation_detail),
-            )
-            continue
-        logger.info("[%s] %s", target.package, validation_detail)
-        controller.force_stop(target.package)
-        ok, detail = installer.apply(target.package, cookie)
-        if ok:
-            succeeded += 1
-            logger.info("[%s] %s", target.package, detail)
-            opened, open_detail = controller.start_lobby(target.package)
-            if not opened:
-                logger.warning(
-                    "[%s] Đã inject cookie nhưng không mở được app: %s",
-                    target.package,
-                    _compact(open_detail),
-                )
-            time.sleep(max(0.0, config.between_apps_seconds))
-        else:
-            logger.error(
-                "[%s] Ghi cookie thất bại: %s", target.package, _compact(detail)
-            )
-    logger.info(
-        "Đã xác minh cookie và ghi XML cho %d/%d package", succeeded, len(targets)
-    )
-    if succeeded:
-        logger.warning(
-            "Roblox Android có thể bỏ qua RBXSession trong XML; trạng thái trên "
-            "không phải xác nhận app đã đăng nhập."
-        )
-    return 0 if succeeded == len(targets) else 2
-
-
-def list_packages(controller: AndroidController, keyword: str) -> int:
-    packages, error = controller.list_packages()
-    if not packages:
-        raise BackendError("Không liệt kê được package: " + _compact(error))
-    keyword = keyword.lower()
-    for package in packages:
-        if not keyword or keyword in package.lower():
-            print(package)
-    return 0
-
-
 def _load_menu_config(path: Path) -> RejoinConfig:
-    if path.exists():
-        return load_config(path)
-    return RejoinConfig(targets=[])
+    return load_config(path) if path.exists() else RejoinConfig(targets=[])
 
 
 def match_package_prefix(packages: Sequence[str], raw_prefix: str) -> List[str]:
     prefix = raw_prefix.strip().lower().rstrip(".")
     if not prefix:
-        raise ConfigError("Bạn chưa nhập tên đầu package")
-    if not re.fullmatch(r"[a-z0-9_]+(?:\.[a-z0-9_]+)*", prefix):
-        raise ConfigError(f"Tên đầu package không hợp lệ: {raw_prefix!r}")
+        raise ConfigError("Chưa nhập tiền tố package")
     return [
-        package
-        for package in packages
-        if package.lower() == prefix or package.lower().startswith(prefix + ".")
+        p for p in packages if p.lower() == prefix or p.lower().startswith(prefix + ".")
     ]
 
 
-def _menu_targets(config: RejoinConfig) -> List[TargetConfig]:
-    return [target for target in config.targets if target.enabled]
-
-
-def _require_menu_targets(config: RejoinConfig) -> List[TargetConfig]:
-    targets = _menu_targets(config)
-    if not targets:
-        raise ConfigError("Chưa chọn package. Hãy dùng chức năng 3 trước.")
-    return targets
-
-
 def _configure_menu_packages(
-    config: RejoinConfig,
-    config_path: Path,
-    controller: AndroidController,
+    config: RejoinConfig, config_path: Path, controller: AndroidController
 ) -> None:
     packages, error = controller.list_packages()
     if not packages:
-        raise BackendError("Không liệt kê được package: " + _compact(error))
-
-    prefix = input(
-        "Nhập tên đầu package để chạy (ví dụ com hoặc com.roblox): "
-    )
+        raise BackendError("Không quét được package: " + _compact(error))
+    prefix = input("\nNhập tên đầu package (ví dụ: com hoặc com.roblox): ").strip()
     selected = match_package_prefix(packages, prefix)
     if not selected:
-        raise ConfigError(f"Không tìm thấy package bắt đầu bằng {prefix.strip()!r}")
-
-    old_targets = {target.package: target for target in config.targets}
-    config.targets = []
-    for package in selected:
-        old = old_targets.get(package)
-        link = old.link if old and RobloxLaunchSpec.parse(old.link).is_valid() else (
-            DEFAULT_BLOX_FRUITS_PLACE_ID
-        )
-        config.targets.append(
-            TargetConfig(
-                package=package,
-                link=link,
-                enabled=True,
-                bounds=old.bounds if old else None,
-            )
-        )
-    config.auto_login_cookies = False
+        raise ConfigError(f"Không tìm thấy package phù hợp với: {prefix}")
+    
+    config.targets = [
+        TargetConfig(package=p, link=DEFAULT_BLOX_FRUITS_PLACE_ID, enabled=True)
+        for p in selected
+    ]
     save_config(config_path, config)
-
-    print(f"\nĐã chọn {len(config.targets)} package theo đúng thứ tự sau:")
-    for index, target in enumerate(config.targets, start=1):
-        print(f"  {index}. {target.package}")
+    print(f"\n[+] Đã chọn {len(config.targets)} packages thành công.")
 
 
 def _configure_menu_links(config: RejoinConfig, config_path: Path) -> None:
-    targets = _require_menu_targets(config)
-    print("\n1. Nhập cho tất cả các package")
-    print("2. Nhập cho từng package")
-    mode = input("Chọn cách nhập [1/2]: ").strip()
-    if mode not in {"1", "2"}:
-        raise ConfigError("Chỉ chấp nhận lựa chọn 1 hoặc 2")
-
-    if mode == "1":
-        raw_link = input(
-            "Nhập Game ID hoặc ServerVip [Enter = Blox Fruits]: "
-        ).strip()
-        link = raw_link or DEFAULT_BLOX_FRUITS_PLACE_ID
-        if not RobloxLaunchSpec.parse(link).is_valid():
-            raise ConfigError("Game ID hoặc ServerVip không hợp lệ")
-        for target in targets:
-            target.link = link
-    else:
-        print("\nCác package đã chọn ở chức năng 3:")
-        updates: List[Tuple[TargetConfig, str]] = []
-        for index, target in enumerate(targets, start=1):
-            raw_link = input(
-                f"{index}. {target.package} [Enter = Blox Fruits]: "
-            ).strip()
-            link = raw_link or DEFAULT_BLOX_FRUITS_PLACE_ID
-            if not RobloxLaunchSpec.parse(link).is_valid():
-                raise ConfigError(
-                    f"Game ID hoặc ServerVip của {target.package} không hợp lệ"
-                )
-            updates.append((target, link))
-        for target, link in updates:
-            target.link = link
-
+    if not config.targets:
+        raise ConfigError("Chưa chọn package. Vui lòng vào mục 3 trước.")
+    raw_link = input("\nNhập Game ID / Server VIP [Enter = Blox Fruits]: ").strip()
+    link = raw_link or DEFAULT_BLOX_FRUITS_PLACE_ID
+    for target in config.targets:
+        target.link = link
     save_config(config_path, config)
-    print("\nĐã lưu Game ID/ServerVip.")
-
-
-def _open_selected_apps(
-    config: RejoinConfig,
-    controller: AndroidController,
-    logger: logging.Logger,
-) -> int:
-    targets = _require_menu_targets(config)
-    opened = 0
-    for index, target in enumerate(targets):
-        ok, detail = controller.start_lobby(target.package)
-        if ok:
-            opened += 1
-            logger.info("[%s] Đã mở app", target.package)
-        else:
-            logger.error("[%s] Không mở được app: %s", target.package, _compact(detail))
-        if index + 1 < len(targets):
-            time.sleep(max(0.0, config.between_apps_seconds))
-    logger.info("Đã mở %d/%d package; không gửi lệnh join", opened, len(targets))
-    return 0 if opened == len(targets) else 2
-
-
-def _run_menu_rejoin(
-    config: RejoinConfig,
-    controller: AndroidController,
-    logger: logging.Logger,
-) -> int:
-    _require_menu_targets(config)
-    run_config = dataclasses.replace(config, auto_login_cookies=False)
-    engine = RejoinEngine(run_config, controller, logger)
-    old_sigint = signal.getsignal(signal.SIGINT)
-    old_sigterm = signal.getsignal(signal.SIGTERM)
-    try:
-        with SingleInstance(DEFAULT_LOCK_PATH), WakeLock(config.wake_lock, logger):
-            return engine.run(once=False)
-    finally:
-        signal.signal(signal.SIGINT, old_sigint)
-        signal.signal(signal.SIGTERM, old_sigterm)
+    print("\n[+] Đã áp dụng Server Link cho tất cả package.")
 
 
 def _login_cookie_menu(
@@ -1955,113 +1389,53 @@ def _login_cookie_menu(
     cookie_path: Path,
     logger: logging.Logger,
 ) -> int:
-    targets = _require_menu_targets(config)
-    print("\n1. Login to all package")
-    print("2. Login to choose package")
-    choice = input("Chọn cách đăng nhập [1/2]: ").strip()
-    if choice == "1":
-        return login_cookies(
-            config, controller, backend, cookie_path, logger
-        )
-    if choice != "2":
-        raise ConfigError("Chỉ chấp nhận lựa chọn 1 hoặc 2")
-
-    packages = [target.package for target in targets]
-    print("\nCác package đã chọn ở chức năng 3:")
-    for index, package in enumerate(packages, start=1):
-        print(f"  {index}. {package}")
-    raw_selection = input(
-        "Nhập số package, nhiều số cách nhau bằng dấu phẩy: "
-    )
-    selected = _parse_selection(raw_selection, packages)
-    if not selected:
-        raise ConfigError("Bạn chưa chọn package để đăng nhập")
-    return login_cookies(
-        config,
-        controller,
-        backend,
-        cookie_path,
-        logger,
-        selected_packages=selected,
-    )
-
-
-def _health_method_menu_label(config: RejoinConfig) -> str:
-    return {
-        "online": "Check Online (Tiến trình + Task Android)",
-        "heartbeat_local": "Check Executor (File .main nội bộ)",
-    }.get(config.health_check_method, config.health_check_method)
+    if not config.targets:
+        raise ConfigError("Chưa có package nào được chọn. Hãy chọn ở mục 3.")
+    packages = [t.package for t in config.targets]
+    cookies = CookieStore.load(cookie_path, packages)
+    installer = CookieInstaller(backend, logger, config.command_timeout_seconds)
+    succeeded = 0
+    for target in config.targets:
+        c = cookies.get(target.package)
+        if not c:
+            continue
+        valid, val_msg = validate_roblox_cookie(c)
+        if not valid:
+            logger.error("[%s] Cookie lỗi: %s", target.package, val_msg)
+            continue
+        logger.info("[%s] %s", target.package, val_msg)
+        controller.force_stop(target.package)
+        ok, _ = installer.apply(target.package, c)
+        if ok:
+            succeeded += 1
+            controller.start_lobby(target.package)
+            time.sleep(1.0)
+    logger.info("Đã đăng nhập thành công cho %d/%d package", succeeded, len(config.targets))
+    return 0
 
 
 def _config_menu(config: RejoinConfig, config_path: Path) -> None:
     while True:
         print("\033[2J\033[H", end="")
-        print("SieuVipPro Rejoin - Config\n")
-        print(f"1. Auto sort tabs: {'ON' if config.freeform else 'OFF'}")
-        print("2. Auto block tat ca acc: KHONG HO TRO")
-        print(f"3. Auto sap xep tabs: {'ON' if config.auto_arrange else 'OFF'}")
-        print(f"4. Check Executor / Check Online: {_health_method_menu_label(config)}")
-        print(
-            "5. Check time (Executor): "
-            f"{config.health_check_timeout_seconds}s"
-        )
-        print("0. Quay lai")
-        try:
-            choice = input("\nChọn cấu hình: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            return
-
+        print("⚡ SieuVipPro Configuration\n")
+        print(f"1. Auto sort tabs (Freeform): {'ON' if config.freeform else 'OFF'}")
+        print(f"2. Auto sắp xếp tabs (Grid): {'ON' if config.auto_arrange else 'OFF'}")
+        print(f"3. Mode Check Sức Khỏe: {config.health_check_method.upper()}")
+        print(f"4. Timeout Watchdog: {config.health_check_timeout_seconds}s")
+        print("0. Quay lại")
+        choice = input("\nChọn mục: ").strip()
         if choice == "0":
-            return
-        if choice == "1":
+            break
+        elif choice == "1":
             config.freeform = not config.freeform
-            save_config(config_path, config)
-            print(
-                "\nAuto sort tabs đã "
-                + ("bật (mở dạng cửa sổ nhỏ)." if config.freeform else "tắt.")
-            )
         elif choice == "2":
-            print(
-                "\nKhông bật Auto block: Roblox không cung cấp API Open Cloud "
-                "chính thức để tự block chéo các tài khoản. Tool không dùng API "
-                "cookie cũ/không được hỗ trợ để tránh khoá hoặc lộ tài khoản."
-            )
-        elif choice == "3":
             config.auto_arrange = not config.auto_arrange
-            save_config(config_path, config)
-            print(
-                "\nAuto sắp xếp tabs đã "
-                + ("bật." if config.auto_arrange else "tắt.")
-            )
+        elif choice == "3":
+            config.health_check_method = "heartbeat" if config.health_check_method == "online" else "online"
         elif choice == "4":
-            print("\n1. Check Online (Kiểm tra tiến trình và task package)")
-            print("2. Check Executor (Heartbeat ngầm qua file .main cục bộ)")
-            method_choice = input("Chọn method [1/2]: ").strip()
-            if method_choice == "1":
-                config.health_check_method = "online"
-            elif method_choice == "2":
-                config.health_check_method = "heartbeat_local"
-            else:
-                raise ConfigError("Chỉ chấp nhận method 1 hoặc 2")
-            save_config(config_path, config)
-            print(f"\nĐã đổi method thành {_health_method_menu_label(config)}.")
-        elif choice == "5":
-            raw_seconds = input(
-                "Số giây không có heartbeat trước khi đóng app [180]: "
-            ).strip()
-            seconds = int(raw_seconds or "180")
-            if not 15 <= seconds <= 3600:
-                raise ConfigError("Check time phải từ 15 đến 3600 giây")
-            config.health_check_timeout_seconds = seconds
-            save_config(config_path, config)
-            print(f"\nĐã đặt Check time = {seconds}s.")
-        else:
-            print("\nLựa chọn không hợp lệ.")
-
-        try:
-            input("\nNhấn Enter để tiếp tục...")
-        except (EOFError, KeyboardInterrupt):
-            return
+            sec = input("Nhập số giây timeout [180]: ").strip()
+            config.health_check_timeout_seconds = int(sec or "180")
+        save_config(config_path, config)
 
 
 def interactive_menu(
@@ -2072,189 +1446,68 @@ def interactive_menu(
     logger: logging.Logger,
 ) -> int:
     config = _load_menu_config(config_path)
-    cached_backend: Optional[AndroidBackend] = None
-
-    def get_android() -> Tuple[AndroidBackend, AndroidController]:
-        nonlocal cached_backend
-        if cached_backend is None:
-            cached_backend = select_backend(requested_backend, adb_serial)
-        controller = AndroidController(
-            cached_backend, logger, config.command_timeout_seconds
-        )
-        return cached_backend, controller
+    backend = select_backend(requested_backend, adb_serial)
+    controller = AndroidController(backend, logger, config.command_timeout_seconds)
 
     while True:
         print("\033[2J\033[H", end="")
-        print("SieuVipPro Rejoin\n")
-        print("1. Start auto rejoin")
-        print("2. Nhap Game ID or ServerVip")
-        print("3. Chon Package de chay")
-        print("4. Open all roblox tab")
-        print("5. Login via cookie")
-        print("13. Config")
-        print("0. Thoat")
-        try:
-            choice = input("\nChọn chức năng: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\nĐã thoát.")
-            return 0
+        print(f"{' '*18}⚡ {Colors.CYAN}{Colors.BOLD}SieuVipPro Dashboard{Colors.RESET}\n")
+        print("┌──────┬────────────────────────────────────────────────────────┐")
+        print(f"│ {Colors.MAGENTA}   1{Colors.RESET}  │ {Colors.CYAN}Start Auto Rejoin Engine                               {Colors.RESET}│")
+        print(f"│ {Colors.MAGENTA}   2{Colors.RESET}  │ {Colors.CYAN}Nhập Game ID / Link Server VIP                         {Colors.RESET}│")
+        print(f"│ {Colors.MAGENTA}   3{Colors.RESET}  │ {Colors.CYAN}Chọn Package Roblox để chạy                            {Colors.RESET}│")
+        print(f"│ {Colors.MAGENTA}   4{Colors.RESET}  │ {Colors.CYAN}Mở tất cả App lên nền (Warm-up)                        {Colors.RESET}│")
+        print(f"│ {Colors.MAGENTA}   5{Colors.RESET}  │ {Colors.CYAN}Login Cookie tự động qua Root (sed)                    {Colors.RESET}│")
+        print(f"│ {Colors.MAGENTA}  13{Colors.RESET}  │ {Colors.GREEN}Cấu hình Nâng cao (Grid / Heartbeat Watchdog)          {Colors.RESET}│")
+        print(f"│ {Colors.MAGENTA}   0{Colors.RESET}  │ {Colors.RED}Thoát Hệ Thống                                         {Colors.RESET}│")
+        print("└──────┴────────────────────────────────────────────────────────┘")
 
         try:
+            choice = input(f"\n{Colors.MAGENTA}Execute -> {Colors.RESET}").strip()
             if choice == "0":
                 return 0
             if choice == "1":
-                _, controller = get_android()
-                _run_menu_rejoin(config, controller, logger)
+                engine = RejoinEngine(config, controller, logger)
+                with SingleInstance(DEFAULT_LOCK_PATH), WakeLock(config.wake_lock, logger):
+                    engine.run(once=False)
             elif choice == "2":
                 _configure_menu_links(config, config_path)
             elif choice == "3":
-                _, controller = get_android()
                 _configure_menu_packages(config, config_path, controller)
             elif choice == "4":
-                _, controller = get_android()
-                _open_selected_apps(config, controller, logger)
+                for t in config.targets:
+                    controller.start_lobby(t.package)
             elif choice == "5":
-                backend, controller = get_android()
-                _login_cookie_menu(
-                    config, controller, backend, cookie_source, logger
-                )
+                _login_cookie_menu(config, controller, backend, cookie_source, logger)
             elif choice == "13":
                 _config_menu(config, config_path)
-            else:
-                print("Lựa chọn không hợp lệ.")
-        except (AppError, ValueError) as exc:
+        except Exception as exc:
             logger.error("%s", exc)
 
-        try:
-            input("\nNhấn Enter để về menu...")
-        except (EOFError, KeyboardInterrupt):
-            return 0
+        input(f"\n{Colors.YELLOW}Nhấn Enter để quay lại menu...{Colors.RESET}")
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Roblox auto rejoin ổn định cho Termux"
-    )
-    parser.add_argument(
-        "--config", type=Path, default=DEFAULT_CONFIG_PATH, help="đường dẫn config JSON"
-    )
-    parser.add_argument(
-        "--cookies",
-        type=Path,
-        default=DEFAULT_COOKIE_PATH,
-        help="kho cookie JSON riêng tư",
-    )
-    parser.add_argument(
-        "--backend",
-        choices=("auto", "direct", "su", "adb", "soft"),
-        default="auto",
-        help="backend chạy lệnh Android (mặc định: auto)",
-    )
-    parser.add_argument("--adb-serial", help="serial adb khi có nhiều device")
-    parser.add_argument("--verbose", action="store_true", help="in log debug")
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    menu_parser = subparsers.add_parser("menu", help="mở menu SieuVipPro")
-    menu_parser.add_argument(
-        "--cookie-source",
-        type=Path,
-        default=DEFAULT_COOKIE_SOURCE_PATH,
-        help="cookie.txt dùng cho chức năng 5",
-    )
-
-    init_parser = subparsers.add_parser("init", help="tạo config bằng menu")
-    init_parser.add_argument("--force", action="store_true", help="ghi đè config")
-
-    subparsers.add_parser("check", help="kiểm tra backend, package và link")
-
-    import_parser = subparsers.add_parser(
-        "import-cookies", help="import cookie.txt/JSON vào kho riêng tư"
-    )
-    import_parser.add_argument("source", type=Path, help="file cookie nguồn")
-
-    subparsers.add_parser("login", help="inject cookie vào các package một lần")
-
-    run_parser = subparsers.add_parser("run", help="chạy auto rejoin")
-    run_parser.add_argument("--once", action="store_true", help="chỉ chạy một chu kỳ")
-    run_parser.add_argument(
-        "--no-wake-lock", action="store_true", help="không lấy Termux wake-lock"
-    )
-
-    list_parser = subparsers.add_parser("list-packages", help="liệt kê package")
-    list_parser.add_argument("keyword", nargs="?", default="")
+    parser = argparse.ArgumentParser(description="Roblox Auto Rejoin Engine")
+    parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
+    parser.add_argument("--cookies", type=Path, default=DEFAULT_COOKIE_SOURCE_PATH)
+    parser.add_argument("--backend", default="auto", choices=("auto", "direct", "su", "adb", "soft"))
+    parser.add_argument("--adb-serial", help="ADB serial")
+    parser.add_argument("--verbose", action="store_true")
+    subparsers = parser.add_subparsers(dest="command")
+    subparsers.add_parser("menu")
     return parser
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    # --- BẮT ĐẦU ĐOẠN SỬA ĐỂ TƯƠNG THÍCH VỚI LỆNH TOIDAY ---
-    # Tự động gán lệnh "menu" nếu file toiday chỉ gọi "python sieuvip.py" trống
     if argv is None:
         argv = sys.argv[1:]
     if not argv:
         argv = ["menu"]
-    # --- KẾT THÚC ĐOẠN SỬA ---
-    
+
     args = build_parser().parse_args(argv)
-    log_path = DEFAULT_LOG_PATH
-    logger = setup_logger(log_path, verbose=args.verbose)
-    try:
-        if args.command == "menu":
-            return interactive_menu(
-                args.config,
-                args.cookie_source,
-                args.backend,
-                args.adb_serial,
-                logger,
-            )
-
-        if args.command == "import-cookies":
-            config = load_config(args.config)
-            return import_cookies(config, args.source, args.cookies)
-
-        backend = select_backend(args.backend, args.adb_serial)
-        logger.info("Backend: %s", backend.description)
-
-        if args.command == "init":
-            return init_config(args.config, backend, logger, args.force)
-
-        config = load_config(args.config)
-        controller = AndroidController(
-            backend, logger, config.command_timeout_seconds
-        )
-        if args.command == "check":
-            return run_check(config, controller, backend, args.cookies, logger)
-        if args.command == "login":
-            return login_cookies(
-                config, controller, backend, args.cookies, logger
-            )
-        if args.command == "list-packages":
-            return list_packages(controller, args.keyword)
-        if args.command == "run":
-            cookie_installer = None
-            cookies: Dict[str, str] = {}
-            if config.auto_login_cookies:
-                packages = [
-                    target.package for target in config.targets if target.enabled
-                ]
-                cookies = CookieStore.load(args.cookies, packages)
-                harden_cookie_file(args.cookies, logger)
-                cookie_installer = CookieInstaller(
-                    backend, logger, config.command_timeout_seconds
-                )
-            engine = RejoinEngine(
-                config,
-                controller,
-                logger,
-                cookie_installer=cookie_installer,
-                cookies=cookies,
-            )
-            use_wake_lock = config.wake_lock and not args.no_wake_lock
-            with SingleInstance(DEFAULT_LOCK_PATH), WakeLock(use_wake_lock, logger):
-                return engine.run(once=args.once)
-        raise AppError(f"Command không xác định: {args.command}")
-    except (AppError, ValueError) as exc:
-        logger.error("%s", exc)
-        return 2
+    logger = setup_logger(DEFAULT_LOG_PATH, verbose=args.verbose)
+    return interactive_menu(args.config, args.cookies, args.backend, args.adb_serial, logger)
 
 
 if __name__ == "__main__":
