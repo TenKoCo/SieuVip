@@ -1305,7 +1305,11 @@ class RejoinEngine:
             for index, target in enumerate(enabled):
                 if self.stop_requested:
                     break
-                if self._run_target(target, bounds[index]):
+                if self._run_target(
+                    target,
+                    bounds[index],
+                    force_rejoin=(cycle == 1),
+                ):
                     succeeded += 1
                 if index + 1 < len(enabled):
                     self._sleep(self.config.between_apps_seconds)
@@ -1329,7 +1333,13 @@ class RejoinEngine:
         self.logger.info("Auto rejoin đã dừng")
         return 0
 
-    def _run_target(self, target: TargetConfig, bounds: Optional[str]) -> bool:
+    def _run_target(
+        self,
+        target: TargetConfig,
+        bounds: Optional[str],
+        *,
+        force_rejoin: bool = False,
+    ) -> bool:
         spec = RobloxLaunchSpec.parse(target.link)
         if not spec.is_valid():
             self.logger.error("[%s] Link/Place ID không hợp lệ", target.package)
@@ -1344,20 +1354,26 @@ class RejoinEngine:
             )
             return False
 
-        healthy, health_detail = self._target_health_once(target)
-        if healthy:
-            self.logger.debug(
-                "[%s] %s còn hợp lệ; giữ nguyên phiên",
+        if not force_rejoin:
+            healthy, health_detail = self._target_health_once(target)
+            if healthy:
+                self.logger.debug(
+                    "[%s] %s còn hợp lệ; giữ nguyên phiên",
+                    target.package,
+                    self._health_method_label(),
+                )
+                return True
+            self.logger.info(
+                "[%s] %s không hợp lệ; bắt đầu rejoin (%s)",
                 target.package,
                 self._health_method_label(),
+                _compact(health_detail),
             )
-            return True
-        self.logger.info(
-            "[%s] %s không hợp lệ; bắt đầu rejoin (%s)",
-            target.package,
-            self._health_method_label(),
-            _compact(health_detail),
-        )
+        else:
+            self.logger.info(
+                "[%s] Lượt đầu: bắt buộc reset và rejoin",
+                target.package,
+            )
 
         self.logger.info("[%s] Chuẩn bị rejoin", target.package)
         if self.controller.backend.can_force_stop:
