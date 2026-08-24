@@ -1,6 +1,6 @@
 #!/data/data/com.termux/files/usr/bin/bash
 # Chạy bằng một lệnh:
-# . <(curl -fsSL https://raw.githubusercontent.com/TenKoCo/SieuVip/refs/heads/main/toiday)
+# . <(curl "https://raw.githubusercontent.com/TenKoCo/SieuVip/refs/heads/main/toiday")
 
 _svr_setup_main() {
     local engine_url
@@ -42,11 +42,6 @@ _svr_setup_main() {
         return 127
     fi
 
-    # Tự yêu cầu quyền storage cơ bản của Termux, không in trạng thái kiểm tra.
-    if command -v termux-setup-storage >/dev/null 2>&1; then
-        termux-setup-storage >/dev/null 2>&1 || true
-    fi
-
     su_bin="$(command -v su 2>/dev/null || true)"
     if [ -z "${su_bin}" ] && [ -x /system/bin/su ]; then
         su_bin="/system/bin/su"
@@ -64,8 +59,9 @@ _svr_setup_main() {
         return 1
     fi
 
-    # Tự cấp các quyền cơ bản nếu Android hiện tại hỗ trợ quyền đó.
-    "${su_bin}" -c "/system/bin/pm grant com.termux android.permission.READ_EXTERNAL_STORAGE >/dev/null 2>&1 || true; /system/bin/pm grant com.termux android.permission.WRITE_EXTERNAL_STORAGE >/dev/null 2>&1 || true; /system/bin/pm grant com.termux android.permission.POST_NOTIFICATIONS >/dev/null 2>&1 || true; /system/bin/appops set com.termux MANAGE_EXTERNAL_STORAGE allow >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
+    # Dùng root tự cấp quyền cơ bản; không gọi termux-setup-storage vì lệnh đó
+    # có thể chờ câu hỏi y/n ẩn và làm loader trông như bị treo.
+    "${su_bin}" -c "/system/bin/pm grant com.termux android.permission.READ_EXTERNAL_STORAGE >/dev/null 2>&1 || true; /system/bin/pm grant com.termux android.permission.WRITE_EXTERNAL_STORAGE >/dev/null 2>&1 || true; /system/bin/pm grant com.termux android.permission.POST_NOTIFICATIONS >/dev/null 2>&1 || true; /system/bin/appops set com.termux READ_EXTERNAL_STORAGE allow >/dev/null 2>&1 || true; /system/bin/appops set com.termux WRITE_EXTERNAL_STORAGE allow >/dev/null 2>&1 || true; /system/bin/appops set com.termux MANAGE_EXTERNAL_STORAGE allow >/dev/null 2>&1 || true; /system/bin/appops set com.termux LEGACY_STORAGE allow >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
 
     if ! mkdir -p "${cache_dir}"; then
         printf '%s\n' '[!] Không tạo được thư mục engine.' >&2
