@@ -17,6 +17,7 @@ import re
 import shlex
 import shutil
 import signal
+import sqlite3
 import subprocess
 import sys
 import time
@@ -592,8 +593,6 @@ def _select_adb_device(adb_path: str, requested_serial: Optional[str]) -> Option
 
 
 class RobloxAuth:
-    """Handles Roblox Authentication Ticket exchange from .ROBLOSECURITY cookies."""
-
     @staticmethod
     def get_csrf_token(cookie: str) -> Optional[str]:
         req = urllib.request.Request(
@@ -650,6 +649,62 @@ class RobloxAuth:
             return None, f"Lỗi sinh Ticket HTTP {exc.code}"
         except Exception as exc:
             return None, f"Lỗi kết nối sinh Ticket: {exc}"
+
+
+class SQLiteCookieInjector:
+    """Creates a Chromium WebView compliant Cookies database and injects it directly."""
+
+    @staticmethod
+    def create_database(cookie_value: str, db_path: Path) -> None:
+        if db_path.exists():
+            db_path.unlink()
+        
+        # Chromium timestamps are microseconds since Windows epoch (Jan 1, 1601 UTC)
+        # Windows Epoch difference: 11644473600 seconds
+        now_micro = int((time.time() + 11644473600) * 1000000)
+        expires_micro = int((time.time() + 11644473600 + (86400 * 365 * 2)) * 1000000)
+
+        conn = sqlite3.connect(str(db_path))
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS meta(key LONGVARCHAR NOT NULL UNIQUE PRIMARY KEY, value LONGVARCHAR);
+        """)
+        cursor.execute("INSERT OR REPLACE INTO meta VALUES('version', '18');")
+        cursor.execute("INSERT OR REPLACE INTO meta VALUES('last_compatible_version', '18');")
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS cookies(
+                creation_utc INTEGER NOT NULL,
+                host_key TEXT NOT NULL,
+                top_frame_site_key TEXT NOT NULL DEFAULT '',
+                name TEXT NOT NULL,
+                value TEXT NOT NULL,
+                encrypted_value BLOB NOT NULL DEFAULT x'',
+                path TEXT NOT NULL,
+                expires_utc INTEGER NOT NULL,
+                is_secure INTEGER NOT NULL,
+                is_httponly INTEGER NOT NULL,
+                last_access_utc INTEGER NOT NULL,
+                has_expires INTEGER NOT NULL,
+                is_persistent INTEGER NOT NULL,
+                priority INTEGER NOT NULL,
+                samesite INTEGER NOT NULL,
+                source_scheme INTEGER NOT NULL,
+                source_port INTEGER NOT NULL DEFAULT -1,
+                is_same_party INTEGER NOT NULL DEFAULT 0,
+                last_update_utc INTEGER NOT NULL DEFAULT 0
+            );
+        """)
+
+        cursor.execute("""
+            INSERT INTO cookies VALUES(
+                ?, '.roblox.com', '', '.ROBLOSECURITY', ?, x'', '/', ?, 1, 1, ?, 1, 1, 1, -1, 2, 443, 0, ?
+            );
+        """, (now_micro, cookie_value, expires_micro, now_micro, now_micro))
+
+        conn.commit()
+        conn.close()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -734,8 +789,8 @@ class RobloxLaunchSpec:
                 sep = "&" if "?" in raw_target else "?"
                 raw_target += f"{sep}ticket={urllib.parse.quote(ticket)}"
             candidates.append(raw_target)
-        if not candidates and ticket:
-            candidates.append(f"roblox://navigation/home?ticket={urllib.parse.quote(ticket)}")
+        if ticket:
+            candidates.append(f"https://www.roblox.com/Login/Negotiate.ashx?suggest={urllib.parse.quote(ticket)}")
         return list(dict.fromkeys(candidates))
 
 
@@ -845,7 +900,7 @@ def validate_roblox_cookie(cookie: str, timeout: float = 10.0) -> Tuple[bool, st
 
 
 class CookieInstaller:
-    """Injects session and uses Auth Ticket handshake."""
+    """Injects SQLite Chromium WebView Database directly into app directory."""
 
     def __init__(
         self,
@@ -867,10 +922,18 @@ class CookieInstaller:
         except ConfigError as exc:
             return False, str(exc)
 
+        # 1. Tạo file SQLite database chuẩn
+        tmp_db = Path("/sdcard/Download/temp_roblox_cookies.db")
+        try:
+            SQLiteCookieInjector.create_database(normalized, tmp_db)
+        except Exception as exc:
+            return False, f"Không tạo được SQLite Database: {exc}"
+
         c = normalized
         if not c.startswith("_|WARNING:-DO-NOT-SHARE-THIS"):
             c = "_|WARNING:-DO-NOT-SHARE-THIS.--Sharing-this-will-allow-someone-to-log-into-your-account-and-rob-your-robox.--|_" + c
 
+        # 2. Đẩy SQLite DB và XML Session vào app directory
         script = f"""
 pkg="{package}"
 app_dir="/data/data/$pkg"
@@ -886,9 +949,17 @@ if [ -z "$owner" ]; then
     owner="1000:1000"
 fi
 
-rm -rf "$app_dir/app_webview" "$app_dir/cache" "$app_dir/code_cache" "$app_dir/databases" "$app_dir/files/GuestData" 2>/dev/null
+# Tạo các đường dẫn Chromium WebView Cookies
+mkdir -p "$app_dir/app_webview/Default/Network"
+mkdir -p "$app_dir/app_webview/Default"
 mkdir -p "$app_dir/shared_prefs"
 
+# Chép SQLite DB vào cả 2 cấu trúc thư mục WebView mới và cũ
+cp -f "{tmp_db}" "$app_dir/app_webview/Default/Network/Cookies"
+cp -f "{tmp_db}" "$app_dir/app_webview/Default/Cookies"
+cp -f "{tmp_db}" "$app_dir/app_webview/Cookies" 2>/dev/null || true
+
+# Tạo thêm XML dự phòng
 cat << 'EOF' > "$app_dir/shared_prefs/com.roblox.client_preferences.xml"
 <?xml version='1.0' encoding='utf-8' standalone='yes' ?>
 <map>
@@ -897,7 +968,9 @@ cat << 'EOF' > "$app_dir/shared_prefs/com.roblox.client_preferences.xml"
 </map>
 EOF
 
-chown -R "$owner" "$app_dir/shared_prefs"
+chown -R "$owner" "$app_dir/app_webview" "$app_dir/shared_prefs"
+chmod 700 "$app_dir/app_webview" "$app_dir/app_webview/Default" "$app_dir/app_webview/Default/Network"
+chmod 600 "$app_dir/app_webview/Default/Network/Cookies" "$app_dir/app_webview/Default/Cookies" 2>/dev/null || true
 chmod 771 "$app_dir/shared_prefs"
 chmod 660 "$app_dir/shared_prefs/com.roblox.client_preferences.xml"
 
@@ -906,9 +979,10 @@ if [ -x /system/bin/restorecon ]; then
 fi
 """
         write_result = self.backend.run(["sh", "-c", script], timeout=self.command_timeout)
+        tmp_db.unlink(missing_ok=True)
         if not write_result.ok:
             return False, f"Lỗi inject: {_compact(write_result.output)}"
-        return True, "Đã chuẩn bị data & SELinux thành công"
+        return True, "Đã bơm SQLite Cookie Database vào app thành công"
 
 
 class AndroidController:
@@ -1264,12 +1338,9 @@ class RejoinEngine:
         if self.config.auto_login_cookies and cookie:
             if self.cookie_installer:
                 self.cookie_installer.apply(target.package, cookie)
-            t_val, msg = RobloxAuth.generate_auth_ticket(cookie)
+            t_val, _ = RobloxAuth.generate_auth_ticket(cookie)
             if t_val:
                 ticket = t_val
-                self.logger.info("[%s] Đã sinh Auth Ticket đăng nhập thành công", target.package)
-            else:
-                self.logger.warning("[%s] Không sinh được Ticket (%s)", target.package, msg)
 
         if force_rejoin:
             opened, _ = self.controller.start_lobby(target.package)
@@ -1465,19 +1536,21 @@ def _login_cookie_menu(
             continue
         logger.info("[%s] %s", target.package, val_msg)
 
-        ticket, t_msg = RobloxAuth.generate_auth_ticket(c)
-        if not ticket:
-            logger.error("[%s] Không sinh được Auth Ticket: %s", target.package, t_msg)
+        # 1. Bơm SQLite Database trực tiếp vào phân vùng WebView
+        ok, msg = installer.apply(target.package, c)
+        if not ok:
+            logger.error("[%s] Lỗi SQLite Inject: %s", target.package, msg)
             continue
+        logger.info("[%s] %s", target.package, msg)
 
-        installer.apply(target.package, c)
-        logger.info("[%s] Đang mở app và truyền Auth Ticket...", target.package)
+        # 2. Sinh SSO Auth Ticket và kích hoạt qua Deep Link
+        ticket, _ = RobloxAuth.generate_auth_ticket(c)
         spec = RobloxLaunchSpec.parse(target.link)
-        ok, _ = controller.start_deep_link(target.package, spec, freeform=False, bounds=None, ticket=ticket)
-        if ok:
-            succeeded += 1
-            time.sleep(2.0)
-    logger.info("Đã hoàn tất đăng nhập cho %d/%d package", succeeded, len(config.targets))
+        controller.start_deep_link(target.package, spec, freeform=False, bounds=None, ticket=ticket)
+        succeeded += 1
+        time.sleep(2.0)
+
+    logger.info("Đã hoàn tất nạp SQLite Cookie cho %d/%d package", succeeded, len(config.targets))
     return 0
 
 
@@ -1524,7 +1597,7 @@ def interactive_menu(
         print(f"│ {Colors.MAGENTA}   2{Colors.RESET}  │ {Colors.CYAN}Nhập Game ID / Link Server VIP                         {Colors.RESET}│")
         print(f"│ {Colors.MAGENTA}   3{Colors.RESET}  │ {Colors.CYAN}Chọn Package Roblox để chạy                            {Colors.RESET}│")
         print(f"│ {Colors.MAGENTA}   4{Colors.RESET}  │ {Colors.CYAN}Mở tất cả App lên nền (Warm-up)                        {Colors.RESET}│")
-        print(f"│ {Colors.MAGENTA}   5{Colors.RESET}  │ {Colors.CYAN}Login Cookie qua Root (Auth Ticket Engine)             {Colors.RESET}│")
+        print(f"│ {Colors.MAGENTA}   5{Colors.RESET}  │ {Colors.CYAN}Login Cookie qua SQLite DB & SSO Negotiate             {Colors.RESET}│")
         print(f"│ {Colors.MAGENTA}  13{Colors.RESET}  │ {Colors.GREEN}Cấu hình Nâng cao (Grid / Heartbeat Watchdog)          {Colors.RESET}│")
         print(f"│ {Colors.MAGENTA}   0{Colors.RESET}  │ {Colors.RED}Thoát Hệ Thống                                         {Colors.RESET}│")
         print("└──────┴────────────────────────────────────────────────────────┘")
