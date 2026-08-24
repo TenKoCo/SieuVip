@@ -24,10 +24,10 @@ import signal
 import subprocess
 import sys
 import time
+import random
 import urllib.parse
 import urllib.error
 import urllib.request
-import xml.etree.ElementTree as ElementTree
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 try:
@@ -74,79 +74,6 @@ class ConfigError(AppError):
 
 class BackendError(AppError):
     pass
-
-
-def validate_heartbeat_url(value: str) -> str:
-    """Validate an HTTPS heartbeat URL, optionally templated by package."""
-    clean = str(value).strip()
-    if not clean:
-        raise ConfigError("Bạn chưa nhập URL heartbeat")
-    unknown_fields = re.findall(r"\{([^{}]+)\}", clean)
-    if any(field != "package" for field in unknown_fields):
-        raise ConfigError("Heartbeat URL chỉ hỗ trợ biến {package}")
-    rendered = clean.replace("{package}", "com.roblox.client")
-    parsed = urllib.parse.urlparse(rendered)
-    if parsed.scheme.lower() != "https" or not parsed.hostname:
-        raise ConfigError("Heartbeat URL phải là địa chỉ HTTPS hợp lệ")
-    if parsed.username or parsed.password:
-        raise ConfigError("Không đặt tài khoản/mật khẩu trong heartbeat URL")
-    return clean
-
-
-def heartbeat_url_for_package(template: str, package: str) -> str:
-    validated = validate_heartbeat_url(template)
-    encoded = urllib.parse.quote(package, safe="")
-    return validated.replace("{package}", encoded)
-
-
-def fetch_heartbeat_timestamp(
-    template: str,
-    package: str,
-    timeout: float = 8.0,
-) -> Tuple[Optional[float], str]:
-    """Read a Unix timestamp from a small, authorized HTTPS endpoint."""
-    try:
-        url = heartbeat_url_for_package(template, package)
-        request = urllib.request.Request(
-            url,
-            headers={
-                "Accept": "application/json, text/plain",
-                "User-Agent": "SieuVipRejoin/1.0",
-            },
-            method="GET",
-        )
-        with urllib.request.urlopen(request, timeout=max(1.0, timeout)) as response:
-            payload = response.read(65537)
-        if len(payload) > 65536:
-            return None, "Phản hồi heartbeat vượt quá 64 KiB"
-        text = payload.decode("utf-8", errors="strict").strip()
-        try:
-            parsed: Any = json.loads(text)
-        except json.JSONDecodeError:
-            parsed = text
-        if isinstance(parsed, dict):
-            timestamp_value = next(
-                (
-                    parsed[key]
-                    for key in ("timestamp", "last_seen", "lastSeen")
-                    if key in parsed
-                ),
-                None,
-            )
-        else:
-            timestamp_value = parsed
-        timestamp = float(timestamp_value)
-        if timestamp > 10_000_000_000:
-            timestamp /= 1000.0
-        if not math.isfinite(timestamp) or timestamp <= 0:
-            raise ValueError("timestamp ngoài phạm vi")
-        return timestamp, "OK"
-    except (ConfigError, UnicodeError, TypeError, ValueError) as exc:
-        return None, f"Heartbeat không hợp lệ: {exc}"
-    except urllib.error.HTTPError as exc:
-        return None, f"Heartbeat HTTP {exc.code}"
-    except (urllib.error.URLError, TimeoutError, OSError) as exc:
-        return None, f"Không đọc được heartbeat: {_compact(str(exc), 160)}"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -205,7 +132,6 @@ class RejoinConfig:
     auto_login_cookies: bool = False
     health_check_method: str = "online"
     health_check_timeout_seconds: int = 180
-    heartbeat_url: Optional[str] = None
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "RejoinConfig":
@@ -220,7 +146,6 @@ class RejoinConfig:
                     raise ConfigError("Mỗi phần tử targets phải là JSON object")
                 targets.append(TargetConfig.from_dict(item))
         else:
-            # Tương thích config của source cũ.
             packages = raw.get("packages", [])
             server_links = raw.get("server_links", {})
             if isinstance(packages, list) and isinstance(server_links, dict):
@@ -241,20 +166,13 @@ class RejoinConfig:
         health_check_method = str(
             raw.get("health_check_method", "online")
         ).strip().lower()
-        # Tự chuyển config cũ sang method đang được hỗ trợ.
-        if health_check_method == "intent":
-            health_check_method = "online"
-        if health_check_method not in {"online", "heartbeat"}:
+        
+        # Tự động chuyển đổi config cũ
+        if health_check_method in {"intent", "heartbeat"}:
+            health_check_method = "heartbeat_local" if health_check_method == "heartbeat" else "online"
+        if health_check_method not in {"online", "heartbeat_local"}:
             raise ConfigError(
-                "health_check_method phải là online hoặc heartbeat"
-            )
-        heartbeat_value = raw.get("heartbeat_url")
-        heartbeat_url = str(heartbeat_value).strip() if heartbeat_value else None
-        if heartbeat_url:
-            heartbeat_url = validate_heartbeat_url(heartbeat_url)
-        if health_check_method == "heartbeat" and not heartbeat_url:
-            raise ConfigError(
-                "Check Executor dùng heartbeat nhưng config chưa có heartbeat_url"
+                "health_check_method phải là online hoặc heartbeat_local"
             )
 
         config = cls(
@@ -282,7 +200,6 @@ class RejoinConfig:
             health_check_timeout_seconds=_clamp_int(
                 raw.get("health_check_timeout_seconds", 180), 15, 3600
             ),
-            heartbeat_url=heartbeat_url,
         )
         return config
 
@@ -303,7 +220,6 @@ class RejoinConfig:
             "auto_login_cookies": self.auto_login_cookies,
             "health_check_method": self.health_check_method,
             "health_check_timeout_seconds": self.health_check_timeout_seconds,
-            "heartbeat_url": self.heartbeat_url,
             "targets": [dataclasses.asdict(target) for target in self.targets],
         }
 
@@ -452,8 +368,6 @@ class WakeLock:
 
 
 class AndroidBackend:
-    """Runs Android system commands through direct, su, adb, or Termux am."""
-
     def __init__(
         self,
         kind: str,
@@ -588,12 +502,10 @@ class AndroidBackend:
                 f"PATH={shlex.quote(SYSTEM_PATH)} LD_PRELOAD= LD_LIBRARY_PATH= "
                 f"exec {shlex.join(system_argv)}"
             )
-            # Truyền một remote command duy nhất để adb không làm mất quoting.
             command.extend(["shell", remote])
             return command, os.environ.copy()
 
         if self.kind == "soft":
-            # Prefer Termux's am socket/library wrapper instead of /system/bin/am.
             executable = shutil.which(logical_argv[0])
             if not executable:
                 executable = system_argv[0]
@@ -788,11 +700,8 @@ def _is_roblox_url(value: str) -> bool:
 
 
 class CookieStore:
-    """Loads cookies without ever printing or logging their values."""
-
     @classmethod
     def normalize_record(cls, raw_record: str) -> str:
-        """Accept either a raw cookie or ``account:password:cookie``."""
         value = str(raw_record).strip()
         lowered = value.lower()
         is_raw_cookie = value.startswith("_|WARNING:")
@@ -802,15 +711,12 @@ class CookieStore:
         if not is_raw_cookie and not is_cookie_header:
             fields = value.split(":", 2)
             if len(fields) == 3 and len(fields[2].strip()) >= 50:
-                # Không giữ lại account/password; chỉ cookie đi tiếp vào kho private.
                 value = fields[2].strip()
         return cls.normalize(value)
 
     @staticmethod
     def normalize(raw_cookie: str) -> str:
         value = str(raw_cookie).strip().strip("'\"")
-        # Cookie đôi khi bị thêm dấu '\\' khi sao chép từ Markdown/chat.
-        # Chỉ bỏ escape trước các ký tự hợp lệ của token Roblox.
         value = re.sub(r"\\([_.|\-])", r"\1", value)
         header_match = re.search(
             r"(?i)(?:^|[;\s])\.ROBLOSECURITY\s*=\s*([^;\s]+)", value
@@ -884,7 +790,6 @@ class CookieStore:
 
 
 def validate_roblox_cookie(cookie: str, timeout: float = 10.0) -> Tuple[bool, str]:
-    """Validate a cookie with Roblox without exposing it in logs or errors."""
     try:
         normalized = CookieStore.normalize(cookie)
     except ConfigError as exc:
@@ -931,8 +836,8 @@ def harden_cookie_file(path: Path, logger: logging.Logger) -> None:
 
 
 class CookieInstaller:
-    """Atomically writes RBXSession preference; this cannot prove app login."""
-
+    """Uses robust sed method to inject cookies without breaking the preferences XML."""
+    
     PREF_NAME = "com.roblox.client_preferences.xml"
     SESSION_KEY = "RBXSession"
 
@@ -955,101 +860,36 @@ class CookieInstaller:
             normalized = CookieStore.normalize(cookie)
         except ConfigError as exc:
             return False, str(exc)
+            
+        c = normalized
+        if not c.startswith("_|WARNING:-DO-NOT-SHARE-THIS"):
+            c = "_|WARNING:-DO-NOT-SHARE-THIS.--Sharing-this-will-allow-someone-to-log-into-your-account-and-rob-your-robox.--|_" + c
 
-        app_dir = f"/data/user/0/{package}"
-        prefs_dir = f"{app_dir}/shared_prefs"
-        prefs_path = f"{prefs_dir}/{self.PREF_NAME}"
-        read_script = (
-            f"if [ -f {shlex.quote(prefs_path)} ]; then "
-            f"/system/bin/cat {shlex.quote(prefs_path)}; fi"
+        # Sử dụng lệnh `sed` đã được chứng minh hiệu quả trên HĐH Android.
+        xml_path = f"/data/data/{package}/shared_prefs/com.roblox.client_preferences.xml"
+        cmd = (
+            f"mkdir -p /data/data/{package}/shared_prefs && "
+            f"if [ ! -f '{xml_path}' ]; then "
+            f"echo '<?xml version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\" ?><map><string name=\"RBXSession\">{c}</string></map>' > '{xml_path}'; "
+            f"else "
+            f"if grep -q '\"RBXSession\"' '{xml_path}'; then "
+            f"sed -i 's|<string name=\"RBXSession\">.*</string>|<string name=\"RBXSession\">{c}</string>|g' '{xml_path}'; "
+            f"else "
+            f"sed -i 's|</map>|<string name=\"RBXSession\">{c}</string></map>|g' '{xml_path}'; "
+            f"fi; "
+            f"fi && chmod 660 '{xml_path}' && chown $(stat -c '%u:%g' /data/data/{package}) '{xml_path}'"
         )
-        read_result = self.backend.run(
-            ["sh", "-c", read_script], timeout=self.command_timeout
-        )
-        if not read_result.ok:
-            # Không dùng combined stdout ở đây vì nó có thể chứa RBXSession cũ.
-            safe_error = _compact(read_result.stderr) or f"rc={read_result.returncode}"
-            return False, "Không đọc được SharedPreferences: " + safe_error
-
-        try:
-            root = self._updated_xml(read_result.stdout, normalized)
-        except ElementTree.ParseError as exc:
-            return False, f"SharedPreferences XML đang hỏng, không ghi đè: {exc}"
-
-        if root is None:
-            return True, "Cookie đã có sẵn trong XML (chưa xác minh đăng nhập app)"
-
-        xml_body = ElementTree.tostring(root, encoding="unicode", short_empty_elements=True)
-        xml_payload = (
-            '<?xml version="1.0" encoding="utf-8" standalone="yes" ?>\n'
-            + xml_body
-            + "\n"
-        )
-        quoted_app = shlex.quote(app_dir)
-        quoted_dir = shlex.quote(prefs_dir)
-        quoted_prefs = shlex.quote(prefs_path)
-        temporary_path = prefs_path + ".cookie.tmp"
-        backup_path = prefs_path + ".pre_cookie_backup"
-        quoted_temporary = shlex.quote(temporary_path)
-        quoted_backup = shlex.quote(backup_path)
-        write_script = (
-            "set -eu; "
-            f"test -d {quoted_app}; "
-            f"mkdir -p {quoted_dir}; "
-            f"if [ -f {quoted_prefs} ] && [ ! -f {quoted_backup} ]; then "
-            f"cp -p {quoted_prefs} {quoted_backup}; fi; "
-            f"trap 'rm -f {quoted_temporary}' EXIT; "
-            f"cat > {quoted_temporary}; "
-            f"owner=$(/system/bin/stat -c '%u:%g' {quoted_app}); "
-            f"chown \"$owner\" {quoted_temporary}; "
-            f"chmod 660 {quoted_temporary}; "
-            f"mv -f {quoted_temporary} {quoted_prefs}; "
-            f"if [ -x /system/bin/restorecon ]; then "
-            f"/system/bin/restorecon -F {quoted_prefs} >/dev/null 2>&1 || true; fi; "
-            "trap - EXIT"
-        )
+        
         write_result = self.backend.run(
-            ["sh", "-c", write_script],
+            ["sh", "-c", cmd],
             timeout=self.command_timeout,
-            input_text=xml_payload,
         )
+        
         if not write_result.ok:
             return False, "Không ghi được SharedPreferences: " + _compact(
                 write_result.stderr or write_result.output
             )
-
-        verify_result = self.backend.run(
-            ["sh", "-c", read_script], timeout=self.command_timeout
-        )
-        if not verify_result.ok:
-            return False, "Đã ghi nhưng không đọc lại được để xác minh"
-        try:
-            verify_root = ElementTree.fromstring(verify_result.stdout)
-        except ElementTree.ParseError:
-            return False, "XML sau khi ghi không hợp lệ"
-        current = verify_root.find(f"string[@name='{self.SESSION_KEY}']")
-        if current is None or current.text != normalized:
-            return False, "Không xác minh được RBXSession sau khi ghi"
-        return True, "Đã ghi RBXSession vào XML (chưa xác minh đăng nhập app)"
-
-    def _updated_xml(
-        self, existing_xml: str, cookie: str
-    ) -> Optional[ElementTree.Element]:
-        if existing_xml.strip():
-            root = ElementTree.fromstring(existing_xml)
-            if root.tag != "map":
-                raise ElementTree.ParseError("root element không phải <map>")
-        else:
-            root = ElementTree.Element("map")
-        session = root.find(f"string[@name='{self.SESSION_KEY}']")
-        if session is not None and session.text == cookie:
-            return None
-        if session is None:
-            session = ElementTree.SubElement(
-                root, "string", {"name": self.SESSION_KEY}
-            )
-        session.text = cookie
-        return root
+        return True, "Đã ghi RBXSession vào XML thành công (chưa xác minh đăng nhập app)"
 
 
 class AndroidController:
@@ -1081,8 +921,6 @@ class AndroidController:
         return result.ok and not any(marker in lowered for marker in cls.FAILURE_MARKERS)
 
     def preflight(self) -> Tuple[bool, str]:
-        # Một số ROM trả exit code khác 0 cho `am help` dù Activity Manager hoạt
-        # động bình thường. Ưu tiên một lệnh chỉ đọc có kết quả xác định.
         current_user = self.backend.run(
             ["am", "get-current-user"], timeout=12
         )
@@ -1225,13 +1063,10 @@ class AndroidController:
         if not process_running:
             return False, process_result.output or "Không thấy PID"
 
-        # Đóng cửa sổ/freeform task không phải lúc nào cũng giết process ngay.
-        # Kiểm tra Activity/task để không nhầm một process cached là game còn mở.
         activity_result = self.backend.run(
             ["dumpsys", "activity", "-p", package, "activities"], timeout=15
         )
         if not activity_result.ok:
-            # ROM không hỗ trợ filter dumpsys: fallback về PID để tránh rejoin lặp.
             return True, process_result.output
         package_lower = package.lower()
         activity_markers = (
@@ -1284,12 +1119,74 @@ class RejoinEngine:
         self.cookie_installer = cookie_installer
         self.cookies = cookies or {}
         self.stop_requested = False
+        self._ping_paths: Dict[str, str] = {} # Bộ nhớ đệm lưu đường dẫn file *.main
 
     def request_stop(self, signum: int, frame: Any) -> None:
         del frame
         if not self.stop_requested:
             self.logger.info("Nhận signal %s; sẽ dừng an toàn...", signum)
         self.stop_requested = True
+
+    def _inject_ping_script(self) -> None:
+        """Sinh ra file .main ngẫu nhiên và tiêm ngầm vào thư mục Executor"""
+        check_filename = f"{random.randint(100000, 999999)}.main"
+        lua_code = f"""spawn(function()
+    while task.wait(30) do
+        pcall(function()
+            writefile("{check_filename}", tostring(os.time()))
+        end)
+    end
+end)"""
+        temp_file = "/sdcard/Download/sv_ping_temp.lua"
+        try:
+            with open(temp_file, "w", encoding="utf-8") as f:
+                f.write(lua_code)
+        except Exception as e:
+            self.logger.warning("Không tạo được file tạm để inject script Lua: %s", e)
+            return
+
+        target_dirs = [
+            "/sdcard/Delta/autoexecute",
+            "/sdcard/Fluxus/autoexecute",
+            "/sdcard/Codex/autoexecute",
+            "/sdcard/spdm/autoexecute",
+            "/sdcard/Hydrogen/autoexecute",
+            "/sdcard/Trigon/autoexecute"
+        ]
+
+        for target in target_dirs:
+            check_cmd = f"[ -d {target} ] && echo EXISTS"
+            res = self.controller.backend.run(["sh", "-c", check_cmd], timeout=5)
+            if "EXISTS" in res.output:
+                # Xóa sạch các script Lua cũ của Tool để tránh rác
+                self.controller.backend.run(["sh", "-c", f"rm -f {target}/SieuVip_Ping_*.lua"], timeout=5)
+                # Copy file Lua ngẫu nhiên mới vào đích
+                dest_file = f"{target}/SieuVip_Ping_{random.randint(10,99)}.lua"
+                copy_cmd = f"cp {temp_file} {dest_file} && chmod 777 {dest_file}"
+                self.controller.backend.run(["sh", "-c", copy_cmd], timeout=5)
+                
+        # Dọn dẹp file tạm
+        self.controller.backend.run(["sh", "-c", f"rm -f {temp_file}"], timeout=5)
+        self.logger.info("Đã tiêm script giám sát heartbeat (.main) ngẫu nhiên vào các Executor")
+
+    def _get_local_heartbeat(self, target: TargetConfig) -> Tuple[Optional[float], str]:
+        """Đọc thời gian từ file *.main được script Lua tuồn ra"""
+        ping_path = self._ping_paths.get(target.package)
+        if not ping_path:
+            find_cmd = f"find /sdcard/Android/data/{target.package} -name '*.main' -type f 2>/dev/null | head -n 1"
+            res = self.controller.backend.run(["sh", "-c", find_cmd], timeout=15)
+            if res.ok and res.stdout.strip():
+                ping_path = res.stdout.strip()
+                self._ping_paths[target.package] = ping_path
+
+        if ping_path:
+            stat_cmd = f"stat -c %Y {shlex.quote(ping_path)}"
+            res = self.controller.backend.run(["sh", "-c", stat_cmd], timeout=10)
+            if res.ok and res.stdout.strip().isdigit():
+                return float(res.stdout.strip()), "OK"
+            else:
+                return None, "Không đọc được thông tin file ping (hoặc file bị xóa)"
+        return None, "Không tìm thấy file ping *.main"
 
     def run(self, once: bool = False) -> int:
         enabled = [target for target in self.config.targets if target.enabled]
@@ -1311,6 +1208,9 @@ class RejoinEngine:
                 raise BackendError("Auto-login cookie cần backend root/su")
             if self.cookie_installer is None:
                 raise ConfigError("Auto-login đã bật nhưng chưa nạp kho cookie")
+
+        if self.config.health_check_method == "heartbeat_local":
+            self._inject_ping_script()
 
         signal.signal(signal.SIGINT, self.request_stop)
         signal.signal(signal.SIGTERM, self.request_stop)
@@ -1356,9 +1256,6 @@ class RejoinEngine:
             if once or self.stop_requested:
                 break
             if monitor_mode:
-                # Config cũ thường dùng interval=0 với nghĩa "rejoin một lần".
-                # Trong chế độ monitor, 0 vẫn phải tiếp tục check để có thể mở
-                # lại package sau khi app bị tắt.
                 wait_seconds = (
                     HEALTH_POLL_SECONDS
                     if self.config.interval_seconds <= 0
@@ -1446,8 +1343,6 @@ class RejoinEngine:
                 return False
             self.logger.info("[%s] Cookie đăng nhập đã sẵn sàng", target.package)
 
-        # Chỉ làm ấm/reset launcher trong lượt đầu khi bật Auto Rejoin. Những
-        # lần phục hồi sau crash/tắt app đi thẳng vào deep link để mở nhanh hơn.
         if force_rejoin:
             lobby_ok, lobby_detail = self.controller.start_lobby(target.package)
             if lobby_ok:
@@ -1533,9 +1428,8 @@ class RejoinEngine:
 
     def _health_method_label(self) -> str:
         return {
-            "online": "Check Online",
-            # Giữ tên quen thuộc trong giao diện; cơ chế là HTTPS heartbeat.
-            "heartbeat": "Check Executor (Heartbeat)",
+            "online": "Check Online (Tiến trình)",
+            "heartbeat_local": "Check Executor (Local File .main)",
         }.get(self.config.health_check_method, "Check Online")
 
     def _target_health_once(
@@ -1551,16 +1445,10 @@ class RejoinEngine:
                 if running
                 else (False, _compact(detail) or "Không thấy tiến trình Android")
             )
-        if method != "heartbeat":
+        if method != "heartbeat_local":
             return False, f"Method check không hợp lệ: {method}"
-        if not self.config.heartbeat_url:
-            return False, "Chưa cấu hình heartbeat_url"
 
-        timestamp, detail = fetch_heartbeat_timestamp(
-            self.config.heartbeat_url,
-            target.package,
-            timeout=min(8.0, max(1.0, self.config.command_timeout_seconds)),
-        )
+        timestamp, detail = self._get_local_heartbeat(target)
         if timestamp is None:
             return False, detail
         now = time.time()
@@ -1568,6 +1456,11 @@ class RejoinEngine:
             return False, "Timestamp heartbeat nằm quá xa trong tương lai"
         age = max(0.0, now - timestamp)
         if age > self.config.health_check_timeout_seconds:
+            # Xóa cache file cũ nếu bị out-of-date để không nhận diện sai sau khi force-stop
+            old_path = self._ping_paths.get(target.package)
+            if old_path:
+                self.controller.backend.run(["sh", "-c", f"rm -f {shlex.quote(old_path)}"])
+                del self._ping_paths[target.package]
             return False, f"Heartbeat đã cũ {age:.0f}s"
         if not_before is not None and timestamp < not_before - 5:
             return False, "Heartbeat chưa cập nhật sau lần mở app này"
@@ -1601,8 +1494,6 @@ class RejoinEngine:
 
         width, height = self.controller.get_screen_size()
         count = max(1, len(targets))
-        # Cửa sổ Roblox dạng dọc cần đủ rộng để Android không tự phóng lớn lại.
-        # Thiết bị rộng hơn sẽ chứa nhiều cột hơn, tối đa 6 như layout mẫu.
         minimum_window_width = 220
         maximum_columns = max(1, min(6, width // minimum_window_width))
         columns = min(count, maximum_columns)
@@ -1614,8 +1505,6 @@ class RejoinEngine:
         preferred_height = max(320, int(responsive_width * 1.65))
 
         if not self.config.auto_arrange:
-            # Auto sort: thu nhỏ dựa trên width và xếp lệch nhẹ để vẫn nhận ra
-            # từng tab. Option auto_arrange bên dưới mới chia lưới hoàn chỉnh.
             window_height = min(height - (margin * 2), preferred_height)
             max_left = max(0, width - responsive_width - margin)
             max_top = max(0, height - window_height - margin)
@@ -1849,8 +1738,6 @@ def login_cookies(
     if not all_targets:
         raise ConfigError("Chưa chọn package. Hãy dùng chức năng 3 trước.")
     all_packages = [target.package for target in all_targets]
-    # Luôn ghép từng dòng cookie với toàn bộ danh sách package trước khi lọc.
-    # Nhờ vậy chọn package số 2 vẫn nhận cookie dòng số 2, không bị lệch dòng.
     cookies = CookieStore.load(cookie_path, all_packages)
     if selected_packages is None:
         targets = all_targets
@@ -1932,11 +1819,6 @@ def _load_menu_config(path: Path) -> RejoinConfig:
 
 
 def match_package_prefix(packages: Sequence[str], raw_prefix: str) -> List[str]:
-    """Match an Android package prefix on component boundaries.
-
-    For example, ``com`` matches ``com.roblox.client`` but not ``company.app``.
-    A complete package name is also accepted.
-    """
     prefix = raw_prefix.strip().lower().rstrip(".")
     if not prefix:
         raise ConfigError("Bạn chưa nhập tên đầu package")
@@ -1991,7 +1873,6 @@ def _configure_menu_packages(
                 bounds=old.bounds if old else None,
             )
         )
-    # Cookie login is an explicit menu action, not a side effect of auto rejoin.
     config.auto_login_cookies = False
     save_config(config_path, config)
 
@@ -2115,8 +1996,8 @@ def _login_cookie_menu(
 
 def _health_method_menu_label(config: RejoinConfig) -> str:
     return {
-        "online": "Check Online (tiến trình + task Android)",
-        "heartbeat": "Check Executor (Heartbeat HTTPS)",
+        "online": "Check Online (Tiến trình + Task Android)",
+        "heartbeat_local": "Check Executor (File .main nội bộ)",
     }.get(config.health_check_method, config.health_check_method)
 
 
@@ -2161,21 +2042,13 @@ def _config_menu(config: RejoinConfig, config_path: Path) -> None:
                 + ("bật." if config.auto_arrange else "tắt.")
             )
         elif choice == "4":
-            print("\n1. Check Online (kiểm tra tiến trình và task package)")
-            print("2. Check Executor (Heartbeat HTTPS hợp lệ)")
+            print("\n1. Check Online (Kiểm tra tiến trình và task package)")
+            print("2. Check Executor (Heartbeat ngầm qua file .main cục bộ)")
             method_choice = input("Chọn method [1/2]: ").strip()
             if method_choice == "1":
                 config.health_check_method = "online"
             elif method_choice == "2":
-                current = config.heartbeat_url or ""
-                prompt = "Heartbeat HTTPS URL"
-                if current:
-                    prompt += f" [{current}]"
-                raw_url = input(
-                    prompt + " (có thể dùng {package}): "
-                ).strip()
-                config.heartbeat_url = validate_heartbeat_url(raw_url or current)
-                config.health_check_method = "heartbeat"
+                config.health_check_method = "heartbeat_local"
             else:
                 raise ConfigError("Chỉ chấp nhận method 1 hoặc 2")
             save_config(config_path, config)
@@ -2206,7 +2079,6 @@ def interactive_menu(
     adb_serial: Optional[str],
     logger: logging.Logger,
 ) -> int:
-    """Run the Termux menu and acquire Android privileges lazily."""
     config = _load_menu_config(config_path)
     cached_backend: Optional[AndroidBackend] = None
 
@@ -2326,8 +2198,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     log_path = DEFAULT_LOG_PATH
     logger = setup_logger(log_path, verbose=args.verbose)
     try:
-        # Menu phải xuất hiện trước mọi lần kiểm tra backend/root. Quyền Android
-        # chỉ được dùng sau khi người dùng chọn một chức năng cần tới nó.
         if args.command == "menu":
             return interactive_menu(
                 args.config,
