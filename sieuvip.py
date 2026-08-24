@@ -1,10 +1,5 @@
 #!/data/data/com.termux/files/usr/bin/python
-"""SieuVip Roblox rejoin engine designed for Termux on Android.
-
-The script only uses Python's standard library. For reliable force-stop/rejoin it
-needs one privileged backend: Magisk/KSU ``su`` or a connected local ``adb shell``.
-An unprivileged soft backend is available, but Android 14+ can reject ``am`` calls.
-"""
+"""SieuVip Roblox rejoin engine designed for Termux on Android."""
 
 from __future__ import annotations
 
@@ -48,7 +43,8 @@ PACKAGE_RE = re.compile(r"^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+$")
 BOUNDS_RE = re.compile(r"^\d+,\d+,\d+,\d+$")
 SYSTEM_PATH = (
     "/product/bin:/apex/com.android.runtime/bin:/apex/com.android.art/bin:"
-    "/system_ext/bin:/system/bin:/system/xbin:/odm/bin:/vendor/bin:/vendor/xbin"
+    "/system_ext/bin:/system/bin:/system/xbin:/odm/bin:/vendor/bin:/vendor/xbin:"
+    "/data/data/com.termux/files/usr/bin"
 )
 SYSTEM_COMMANDS = {
     "am",
@@ -180,7 +176,7 @@ class RejoinConfig:
         if health_check_method not in {"online", "heartbeat"}:
             health_check_method = "online"
 
-        config = cls(
+        return cls(
             targets=targets,
             interval_seconds=max(0, int(float(interval))),
             warmup_seconds=_clamp_float(raw.get("warmup_seconds", 2.5), 0, 60),
@@ -206,7 +202,6 @@ class RejoinConfig:
                 raw.get("health_check_timeout_seconds", 180), 15, 3600
             ),
         )
-        return config
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -251,7 +246,7 @@ def load_config(path: Path) -> RejoinConfig:
             raw = json.load(file)
     except FileNotFoundError as exc:
         raise ConfigError(
-            f"Không thấy config {path}. Hãy chạy thiết lập package trước."
+            f"Chưa có cấu hình tại {path}. Hãy chọn mục 3 để thêm Package."
         ) from exc
     except (OSError, json.JSONDecodeError) as exc:
         raise ConfigError(f"Không đọc được config {path}: {exc}") from exc
@@ -259,9 +254,9 @@ def load_config(path: Path) -> RejoinConfig:
 
 
 def save_config(path: Path, config: RejoinConfig) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + ".tmp")
         with temporary.open("w", encoding="utf-8") as file:
             json.dump(config.to_dict(), file, ensure_ascii=False, indent=2)
             file.write("\n")
@@ -269,15 +264,15 @@ def save_config(path: Path, config: RejoinConfig) -> None:
             os.fsync(file.fileno())
         os.replace(temporary, path)
     except OSError as exc:
-        try:
-            temporary.unlink(missing_ok=True)
-        except OSError:
-            pass
         raise ConfigError(f"Không lưu được config {path}: {exc}") from exc
 
 
 def setup_logger(log_path: Path, verbose: bool = False) -> logging.Logger:
-    log_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+
     logger = logging.getLogger(APP_NAME)
     logger.handlers.clear()
     logger.setLevel(logging.DEBUG)
@@ -297,9 +292,7 @@ def setup_logger(log_path: Path, verbose: bool = False) -> logging.Logger:
         )
         rotating.setLevel(logging.DEBUG)
         rotating.setFormatter(
-            logging.Formatter(
-                "%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S"
-            )
+            logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S")
         )
         logger.addHandler(rotating)
     except OSError:
@@ -313,18 +306,19 @@ class SingleInstance:
         self.file: Optional[Any] = None
 
     def __enter__(self) -> "SingleInstance":
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.file = self.path.open("a+", encoding="utf-8")
-        if fcntl is None:
-            return self
         try:
-            fcntl.flock(self.file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.file = self.path.open("a+", encoding="utf-8")
+            if fcntl is not None:
+                fcntl.flock(self.file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.file.seek(0)
+            self.file.truncate()
+            self.file.write(str(os.getpid()))
+            self.file.flush()
         except BlockingIOError as exc:
-            raise AppError("Đã có một tiến trình auto rejoin khác đang chạy") from exc
-        self.file.seek(0)
-        self.file.truncate()
-        self.file.write(str(os.getpid()))
-        self.file.flush()
+            raise AppError("Đã có một tiến trình auto rejoin khác đang chạy!") from exc
+        except OSError:
+            pass
         return self
 
     def __exit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
@@ -332,6 +326,8 @@ class SingleInstance:
             try:
                 if fcntl is not None:
                     fcntl.flock(self.file.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
             finally:
                 self.file.close()
 
@@ -344,15 +340,13 @@ class WakeLock:
 
     def __enter__(self) -> "WakeLock":
         command = shutil.which("termux-wake-lock")
-        if not self.enabled:
-            return self
-        if not command:
+        if not self.enabled or not command:
             return self
         try:
             result = subprocess.run(
                 [command], capture_output=True, text=True, timeout=8, check=False
             )
-            self.acquired = result.returncode == 0
+            self.acquired = (result.returncode == 0)
         except (OSError, subprocess.SubprocessError):
             pass
         return self
@@ -362,9 +356,12 @@ class WakeLock:
             return
         command = shutil.which("termux-wake-unlock")
         if command:
-            subprocess.run(
-                [command], capture_output=True, text=True, timeout=8, check=False
-            )
+            try:
+                subprocess.run(
+                    [command], capture_output=True, text=True, timeout=8, check=False
+                )
+            except (OSError, subprocess.SubprocessError):
+                pass
 
 
 class AndroidBackend:
@@ -400,7 +397,7 @@ class AndroidBackend:
     @property
     def description(self) -> str:
         if self.kind == "direct":
-            return f"direct uid={os.geteuid()}"
+            return f"direct root uid={os.geteuid()}"
         if self.kind == "su":
             return f"root qua {self.su_path}"
         if self.kind == "adb":
@@ -527,15 +524,11 @@ def select_backend(requested: str, adb_serial: Optional[str]) -> AndroidBackend:
     uid = os.geteuid()
     if requested in {"auto", "direct"} and uid in {0, 2000}:
         return AndroidBackend("direct")
-    if requested == "direct":
-        raise BackendError(f"direct cần uid root/shell, uid hiện tại là {uid}")
 
     if requested in {"auto", "su"}:
         su_path = _find_su()
         if su_path and _probe_su(su_path):
             return AndroidBackend("su", su_path=su_path)
-        if requested == "su":
-            raise BackendError("Không lấy được quyền root bằng su -c")
 
     if requested in {"auto", "adb"}:
         adb_path = shutil.which("adb")
@@ -547,7 +540,7 @@ def select_backend(requested: str, adb_serial: Optional[str]) -> AndroidBackend:
     am_path = shutil.which("am")
     if requested in {"auto", "soft"} and (am_path or Path("/system/bin/am").exists()):
         return AndroidBackend("soft")
-    raise BackendError("Không tìm được backend Android có thể sử dụng")
+    raise BackendError("Không tìm thấy quyền Root (su) hoặc backend Android hợp lệ!")
 
 
 def _probe_su(su_path: str) -> bool:
@@ -645,15 +638,10 @@ class RobloxLaunchSpec:
             match = re.search(r"(?i)\bplaceid=(\d+)", clean)
             place_id = match.group(1) if match else None
         if not game_instance_id:
-            match = re.search(
-                r"(?i)\b(?:gameinstanceid|jobid)=([a-z0-9-]+)", clean
-            )
+            match = re.search(r"(?i)\b(?:gameinstanceid|jobid)=([a-z0-9-]+)", clean)
             game_instance_id = match.group(1) if match else None
         if not link_code:
-            match = re.search(
-                r"(?i)\b(?:privateserverlinkcode|linkcode)=([a-z0-9_-]+)",
-                clean,
-            )
+            match = re.search(r"(?i)\b(?:privateserverlinkcode|linkcode)=([a-z0-9_-]+)", clean)
             link_code = match.group(1) if match else None
         if not access_code:
             match = re.search(r"(?i)\baccesscode=([a-z0-9_-]+)", clean)
@@ -699,9 +687,7 @@ class CookieStore:
         value = str(raw_record).strip()
         lowered = value.lower()
         is_raw_cookie = value.startswith("_|WARNING:")
-        is_cookie_header = lowered.startswith(".roblosecurity=") or lowered.startswith(
-            "cookie:"
-        )
+        is_cookie_header = lowered.startswith(".roblosecurity=") or lowered.startswith("cookie:")
         if not is_raw_cookie and not is_cookie_header:
             fields = value.split(":", 2)
             if len(fields) == 3 and len(fields[2].strip()) >= 50:
@@ -712,23 +698,19 @@ class CookieStore:
     def normalize(raw_cookie: str) -> str:
         value = str(raw_cookie).strip().strip("'\"")
         value = re.sub(r"\\([_.|\-])", r"\1", value)
-        header_match = re.search(
-            r"(?i)(?:^|[;\s])\.ROBLOSECURITY\s*=\s*([^;\s]+)", value
-        )
+        header_match = re.search(r"(?i)(?:^|[;\s])\.ROBLOSECURITY\s*=\s*([^;\s]+)", value)
         if header_match:
             value = header_match.group(1).strip()
         if any(character in value for character in ("\x00", "\r", "\n")):
             raise ConfigError("Cookie chứa ký tự điều khiển không hợp lệ")
-        if "\\" in value:
-            raise ConfigError(
-                "Cookie còn chứa dấu \\ không hợp lệ; hãy chép lại cookie gốc"
-            )
         if len(value) < 50:
             raise ConfigError("Cookie quá ngắn hoặc không đúng định dạng")
         return value
 
     @classmethod
     def load(cls, path: Path, packages: Sequence[str]) -> Dict[str, str]:
+        if not path.exists():
+            raise ConfigError(f"Không tìm thấy file: {path}. Hãy tạo file và dán cookie vào!")
         try:
             content = path.read_text(encoding="utf-8")
         except OSError as exc:
@@ -742,12 +724,11 @@ class CookieStore:
 
         if isinstance(decoded, dict):
             raw_mapping = decoded.get("cookies", decoded)
-            if not isinstance(raw_mapping, dict):
-                raise ConfigError("Trường cookies phải là JSON object")
-            for package, cookie in raw_mapping.items():
-                package_text = str(package).strip()
-                if PACKAGE_RE.fullmatch(package_text) and isinstance(cookie, str):
-                    mapping[package_text] = cls.normalize_record(cookie)
+            if isinstance(raw_mapping, dict):
+                for package, cookie in raw_mapping.items():
+                    package_text = str(package).strip()
+                    if PACKAGE_RE.fullmatch(package_text) and isinstance(cookie, str):
+                        mapping[package_text] = cls.normalize_record(cookie)
         else:
             lines = [
                 line.strip()
@@ -758,7 +739,7 @@ class CookieStore:
                 mapping[package] = cls.normalize_record(cookie)
 
         if not mapping:
-            raise ConfigError(f"Không tìm thấy cookie hợp lệ trong {path}")
+            raise ConfigError(f"Không có cookie hợp lệ trong {path}")
         return mapping
 
 
@@ -822,21 +803,20 @@ class CookieInstaller:
             c = "_|WARNING:-DO-NOT-SHARE-THIS.--Sharing-this-will-allow-someone-to-log-into-your-account-and-rob-your-robox.--|_" + c
 
         xml_path = f"/data/data/{package}/shared_prefs/{self.PREF_NAME}"
+        # Ghi trực tiếp không dùng sed regex delimiter để tránh xung đột ký tự '|'
         cmd = (
             f"mkdir -p /data/data/{package}/shared_prefs && "
             f"if [ ! -f '{xml_path}' ]; then "
             f"echo '<?xml version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\" ?><map><string name=\"RBXSession\">{c}</string></map>' > '{xml_path}'; "
             f"else "
-            f"if grep -q '\"RBXSession\"' '{xml_path}'; then "
-            f"sed -i 's|<string name=\"RBXSession\">.*</string>|<string name=\"RBXSession\">{c}</string>|g' '{xml_path}'; "
-            f"else "
-            f"sed -i 's|</map>|<string name=\"RBXSession\">{c}</string></map>|g' '{xml_path}'; "
-            f"fi; "
+            f"grep -v '\"RBXSession\"' '{xml_path}' | sed 's|</map>||g' > '{xml_path}.tmp' 2>/dev/null; "
+            f"echo '<string name=\"RBXSession\">{c}</string></map>' >> '{xml_path}.tmp'; "
+            f"mv -f '{xml_path}.tmp' '{xml_path}'; "
             f"fi && chmod 660 '{xml_path}' && chown $(stat -c '%u:%g' /data/data/{package}) '{xml_path}'"
         )
         write_result = self.backend.run(["sh", "-c", cmd], timeout=self.command_timeout)
         if not write_result.ok:
-            return False, f"Không ghi được cookie qua sed: {_compact(write_result.output)}"
+            return False, f"Lỗi ghi XML: {_compact(write_result.output)}"
         return True, "Đã ghi RBXSession vào XML thành công"
 
 
@@ -877,29 +857,14 @@ class AndroidController:
 
         help_result = self.backend.run(["am", "help"], timeout=12)
         help_text = help_result.output.lower()
-        help_is_valid = (
-            "activity manager" in help_text
-            and "start-activity" in help_text
-            and not any(
-                marker in help_text
-                for marker in (
-                    "securityexception",
-                    "permission denial",
-                    "not allowed",
-                    "not found",
-                )
-            )
-        )
-        if help_is_valid:
+        if "activity manager" in help_text and not any(
+            m in help_text for m in ("securityexception", "permission denial", "not allowed")
+        ):
             return True, help_result.output
         return False, current_user.output or help_result.output
 
     def force_stop(self, package: str) -> Tuple[bool, str]:
-        if not self.backend.can_force_stop:
-            return False, "backend soft không có quyền force-stop"
-        result = self.backend.run(
-            ["am", "force-stop", package], timeout=self.command_timeout
-        )
+        result = self.backend.run(["am", "force-stop", package], timeout=self.command_timeout)
         return self.command_accepted(result), result.output
 
     def start_lobby(self, package: str) -> Tuple[bool, str]:
@@ -1014,24 +979,16 @@ class AndroidController:
             and any(marker in line.lower() for marker in activity_markers)
             for line in activity_result.output.splitlines()
         )
-        if task_running:
-            return True, process_result.output
-        return False, "PID còn tồn tại nhưng không còn Activity Roblox"
+        return (True, process_result.output) if task_running else (False, "Process treo/không có Activity")
 
     def get_screen_size(self) -> Tuple[int, int]:
         result = self.backend.run(["wm", "size"], timeout=10)
         matches = re.findall(r"(?i)(\d+)x(\d+)", result.output)
-        if matches:
-            return tuple(map(int, matches[-1]))
-        return 720, 1280
+        return tuple(map(int, matches[-1])) if matches else (720, 1280)
 
     def randomize_android_id(self) -> Tuple[bool, str]:
-        if not self.backend.can_write_secure_settings:
-            return False, "backend không cho phép ghi secure settings"
         value = os.urandom(8).hex()
-        result = self.backend.run(
-            ["settings", "put", "secure", "android_id", value], timeout=15
-        )
+        result = self.backend.run(["settings", "put", "secure", "android_id", value], timeout=15)
         return self.command_accepted(result), result.output
 
 
@@ -1097,11 +1054,22 @@ class RejoinEngine:
     def _read_local_heartbeat(self, package: str) -> Tuple[Optional[float], str]:
         path = self._ping_paths.get(package)
         if not path:
-            find_cmd = f"find /sdcard/Android/data/{package} -name '*.main' -type f 2>/dev/null | head -n 1"
-            res = self.controller.backend.run(["sh", "-c", find_cmd], timeout=10)
-            if res.ok and res.stdout.strip():
-                path = res.stdout.strip()
-                self._ping_paths[package] = path
+            search_paths = [
+                f"/sdcard/Android/data/{package}",
+                "/sdcard/Delta/workspace",
+                "/sdcard/Fluxus/workspace",
+                "/sdcard/Codex/workspace",
+                "/sdcard/spdm/workspace",
+                "/sdcard/Hydrogen/workspace",
+                "/sdcard/Trigon/workspace",
+            ]
+            for sp in search_paths:
+                find_cmd = f"find {sp} -name '*.main' -type f 2>/dev/null | head -n 1"
+                res = self.controller.backend.run(["sh", "-c", find_cmd], timeout=8)
+                if res.ok and res.stdout.strip():
+                    path = res.stdout.strip()
+                    self._ping_paths[package] = path
+                    break
 
         if path:
             res = self.controller.backend.run(["sh", "-c", f"stat -c %Y {shlex.quote(path)}"], timeout=8)
@@ -1113,13 +1081,11 @@ class RejoinEngine:
     def run(self, once: bool = False) -> int:
         enabled = [target for target in self.config.targets if target.enabled]
         if not enabled:
-            raise ConfigError("Không có package nào đang được bật")
+            raise ConfigError("Không có package nào đang được chọn!")
 
         ok, detail = self.controller.preflight()
         if not ok:
-            raise BackendError(
-                "Backend không chạy được Activity Manager: " + _compact(detail)
-            )
+            raise BackendError("Không chạy được Activity Manager: " + _compact(detail))
 
         if self.config.health_check_method == "heartbeat":
             self._inject_ping_script_silently()
@@ -1127,15 +1093,16 @@ class RejoinEngine:
         signal.signal(signal.SIGINT, self.request_stop)
         signal.signal(signal.SIGTERM, self.request_stop)
         cycle = 0
+
         while not self.stop_requested:
             cycle += 1
             started = time.monotonic()
             self.logger.info("========== Chu kỳ %d ==========", cycle)
 
             if self.config.randomize_android_id_each_cycle:
-                changed, change_detail = self.controller.randomize_android_id()
+                changed, _ = self.controller.randomize_android_id()
                 if changed:
-                    self.logger.info("Đã đổi Android ID ngẫu nhiên cho chu kỳ %d", cycle)
+                    self.logger.info("Đã đổi Android ID ngẫu nhiên")
 
             bounds = self._resolve_bounds(enabled)
             succeeded = 0
@@ -1147,23 +1114,31 @@ class RejoinEngine:
                 if index + 1 < len(enabled):
                     self._sleep(self.config.between_apps_seconds)
 
-            elapsed = time.monotonic() - started
             self.logger.info(
                 "Chu kỳ %d hoàn tất: %d/%d app ổn định (%.1fs)",
                 cycle,
                 succeeded,
                 len(enabled),
-                elapsed,
+                time.monotonic() - started,
             )
             if once or self.stop_requested:
                 break
 
-            wait_limit = (
-                HEALTH_POLL_SECONDS
-                if self.config.interval_seconds <= 0
-                else min(self.config.interval_seconds, HEALTH_POLL_SECONDS)
+            # Vòng lặp Watchdog giám sát liên tục từng 5s
+            deadline = time.monotonic() + (
+                self.config.interval_seconds if self.config.interval_seconds > 0 else 86400 * 365
             )
-            self._sleep(wait_limit)
+            while time.monotonic() < deadline and not self.stop_requested:
+                self._sleep(HEALTH_POLL_SECONDS)
+                for index, target in enumerate(enabled):
+                    healthy, detail = self._target_health_once(target)
+                    if not healthy:
+                        self.logger.warning(
+                            "[%s] Phát hiện bất thường (%s) -> Tự động phục hồi!",
+                            target.package,
+                            detail,
+                        )
+                        self._run_target(target, bounds[index], force_rejoin=False)
 
         self.logger.info("Engine đã dừng.")
         return 0
@@ -1184,11 +1159,10 @@ class RejoinEngine:
             healthy, health_detail = self._target_health_once(target)
             if healthy:
                 return True
-            self.logger.info("[%s] Phát hiện mất kết nối/kẹt (%s) -> Rejoin", target.package, health_detail)
+            self.logger.info("[%s] Bắt đầu khởi động lại (%s)", target.package, health_detail)
 
-        if self.controller.backend.can_force_stop:
-            self.controller.force_stop(target.package)
-            self._sleep(0.5)
+        self.controller.force_stop(target.package)
+        self._sleep(0.5)
 
         if self.config.auto_login_cookies:
             cookie = self.cookies.get(target.package)
@@ -1199,15 +1173,14 @@ class RejoinEngine:
             opened, _ = self.controller.start_lobby(target.package)
             if opened:
                 self._sleep(self.config.warmup_seconds)
-                if self.controller.backend.can_force_stop:
-                    self.controller.force_stop(target.package)
-                    self._sleep(0.5)
+                self.controller.force_stop(target.package)
+                self._sleep(0.5)
 
         attempts = self.config.retries + 1
         for attempt in range(1, attempts + 1):
             if self.stop_requested:
                 return False
-            if attempt > 1 and self.controller.backend.can_force_stop:
+            if attempt > 1:
                 self.controller.force_stop(target.package)
                 self._sleep(0.5)
 
@@ -1325,20 +1298,6 @@ def _compact(value: str, limit: int = 300) -> str:
     return compact if len(compact) <= limit else compact[:limit - 1] + "…"
 
 
-def _parse_selection(raw: str, matches: List[str]) -> List[str]:
-    clean = raw.strip()
-    if clean.lower() in {"all", "a", "*"}:
-        return matches
-    selected = []
-    for item in clean.split(","):
-        item = item.strip()
-        if item.isdigit() and 1 <= int(item) <= len(matches):
-            selected.append(matches[int(item) - 1])
-        elif PACKAGE_RE.fullmatch(item):
-            selected.append(item)
-    return list(dict.fromkeys(selected))
-
-
 def _load_menu_config(path: Path) -> RejoinConfig:
     return load_config(path) if path.exists() else RejoinConfig(targets=[])
 
@@ -1347,9 +1306,7 @@ def match_package_prefix(packages: Sequence[str], raw_prefix: str) -> List[str]:
     prefix = raw_prefix.strip().lower().rstrip(".")
     if not prefix:
         raise ConfigError("Chưa nhập tiền tố package")
-    return [
-        p for p in packages if p.lower() == prefix or p.lower().startswith(prefix + ".")
-    ]
+    return [p for p in packages if p.lower() == prefix or p.lower().startswith(prefix + ".")]
 
 
 def _configure_menu_packages(
@@ -1362,7 +1319,7 @@ def _configure_menu_packages(
     selected = match_package_prefix(packages, prefix)
     if not selected:
         raise ConfigError(f"Không tìm thấy package phù hợp với: {prefix}")
-    
+
     config.targets = [
         TargetConfig(package=p, link=DEFAULT_BLOX_FRUITS_PLACE_ID, enabled=True)
         for p in selected
@@ -1457,7 +1414,7 @@ def interactive_menu(
         print(f"│ {Colors.MAGENTA}   2{Colors.RESET}  │ {Colors.CYAN}Nhập Game ID / Link Server VIP                         {Colors.RESET}│")
         print(f"│ {Colors.MAGENTA}   3{Colors.RESET}  │ {Colors.CYAN}Chọn Package Roblox để chạy                            {Colors.RESET}│")
         print(f"│ {Colors.MAGENTA}   4{Colors.RESET}  │ {Colors.CYAN}Mở tất cả App lên nền (Warm-up)                        {Colors.RESET}│")
-        print(f"│ {Colors.MAGENTA}   5{Colors.RESET}  │ {Colors.CYAN}Login Cookie tự động qua Root (sed)                    {Colors.RESET}│")
+        print(f"│ {Colors.MAGENTA}   5{Colors.RESET}  │ {Colors.CYAN}Login Cookie tự động qua Root (sed/grep)               {Colors.RESET}│")
         print(f"│ {Colors.MAGENTA}  13{Colors.RESET}  │ {Colors.GREEN}Cấu hình Nâng cao (Grid / Heartbeat Watchdog)          {Colors.RESET}│")
         print(f"│ {Colors.MAGENTA}   0{Colors.RESET}  │ {Colors.RED}Thoát Hệ Thống                                         {Colors.RESET}│")
         print("└──────┴────────────────────────────────────────────────────────┘")
