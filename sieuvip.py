@@ -17,7 +17,6 @@ import re
 import shlex
 import shutil
 import signal
-import sqlite3
 import subprocess
 import sys
 import time
@@ -34,10 +33,9 @@ except ImportError:
 
 APP_NAME = "sieuvip-rejoin"
 DEFAULT_CONFIG_PATH = Path("/sdcard/Download/sieuvip_config.json")
-DEFAULT_COOKIE_PATH = Path("/sdcard/Download/cookies_store.json")
 DEFAULT_LOG_PATH = Path("/sdcard/Download/sieuvip_rejoin.log")
 DEFAULT_LOCK_PATH = Path("/sdcard/Download/sieuvip_rejoin.lock")
-DEFAULT_COOKIE_SOURCE_PATH = Path("/sdcard/Download/cookie.txt")
+DEFAULT_SNAPSHOT_DIR = Path("/sdcard/Download/RobloxSnapshots")
 DEFAULT_BLOX_FRUITS_PLACE_ID = "2753915549"
 HEALTH_POLL_SECONDS = 5.0
 PACKAGE_RE = re.compile(r"^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+$")
@@ -137,7 +135,6 @@ class RejoinConfig:
     freeform: bool = False
     auto_arrange: bool = False
     randomize_android_id_each_cycle: bool = False
-    auto_login_cookies: bool = False
     health_check_method: str = "online"
     health_check_timeout_seconds: int = 180
 
@@ -197,7 +194,6 @@ class RejoinConfig:
             randomize_android_id_each_cycle=bool(
                 raw.get("randomize_android_id_each_cycle", False)
             ),
-            auto_login_cookies=bool(raw.get("auto_login_cookies", False)),
             health_check_method=health_check_method,
             health_check_timeout_seconds=_clamp_int(
                 raw.get("health_check_timeout_seconds", 180), 15, 3600
@@ -218,7 +214,6 @@ class RejoinConfig:
             "randomize_android_id_each_cycle": (
                 self.randomize_android_id_each_cycle
             ),
-            "auto_login_cookies": self.auto_login_cookies,
             "health_check_method": self.health_check_method,
             "health_check_timeout_seconds": self.health_check_timeout_seconds,
             "targets": [dataclasses.asdict(target) for target in self.targets],
@@ -592,119 +587,69 @@ def _select_adb_device(adb_path: str, requested_serial: Optional[str]) -> Option
     return devices[0] if len(devices) == 1 else None
 
 
-class RobloxAuth:
-    @staticmethod
-    def get_csrf_token(cookie: str) -> Optional[str]:
-        req = urllib.request.Request(
-            "https://auth.roblox.com/v1/authentication-ticket/",
-            data=b"{}",
-            headers={
-                "Cookie": f".ROBLOSECURITY={cookie}",
-                "Content-Type": "application/json",
-                "User-Agent": "Roblox/Android",
-                "Referer": "https://www.roblox.com/",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                return resp.headers.get("x-csrf-token")
-        except urllib.error.HTTPError as exc:
-            return exc.headers.get("x-csrf-token")
-        except Exception:
-            return None
+class SnapshotManager:
+    """Hot-Swap Data Snapshot engine for reliable multi-account management on Android."""
 
-    @staticmethod
-    def generate_auth_ticket(cookie: str) -> Tuple[Optional[str], str]:
-        csrf = RobloxAuth.get_csrf_token(cookie)
-        if not csrf:
-            return None, "Không lấy được CSRF Token từ Roblox API"
+    def __init__(self, backend: AndroidBackend, logger: logging.Logger) -> None:
+        self.backend = backend
+        self.logger = logger
+        DEFAULT_SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
 
-        req = urllib.request.Request(
-            "https://auth.roblox.com/v1/authentication-ticket/",
-            data=b"{}",
-            headers={
-                "Cookie": f".ROBLOSECURITY={cookie}",
-                "Content-Type": "application/json",
-                "User-Agent": "Roblox/Android",
-                "Referer": "https://www.roblox.com/",
-                "x-csrf-token": csrf,
-                "RBXAuthenticationNegotiation": "1",
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                ticket = resp.headers.get("rbx-authentication-ticket")
-                if ticket:
-                    return ticket.strip(), "OK"
-                try:
-                    payload = json.loads(resp.read().decode())
-                    if "ticket" in payload:
-                        return str(payload["ticket"]).strip(), "OK"
-                except Exception:
-                    pass
-                return None, "Roblox không trả về Auth Ticket"
-        except urllib.error.HTTPError as exc:
-            return None, f"Lỗi sinh Ticket HTTP {exc.code}"
-        except Exception as exc:
-            return None, f"Lỗi kết nối sinh Ticket: {exc}"
+    def backup_account(self, package: str, account_name: str) -> Tuple[bool, str]:
+        tar_file = DEFAULT_SNAPSHOT_DIR / f"{account_name}.tar.gz"
+        script = f"""
+pkg="{package}"
+app_dir="/data/data/$pkg"
+if [ ! -d "$app_dir" ] && [ -d "/data/user/0/$pkg" ]; then
+    app_dir="/data/user/0/$pkg"
+fi
 
+am force-stop "$pkg" 2>/dev/null
+killall -9 "$pkg" 2>/dev/null
+cd "$app_dir" && tar --exclude='cache' --exclude='code_cache' -czf "{tar_file}" .
+"""
+        res = self.backend.run(["sh", "-c", script], timeout=40)
+        if res.ok and tar_file.exists():
+            return True, f"Đã lưu Snapshot tài khoản vào: {tar_file.name}"
+        return False, f"Lỗi sao lưu: {_compact(res.output)}"
 
-class SQLiteCookieInjector:
-    """Creates a Chromium WebView compliant Cookies database and injects it directly."""
+    def restore_account(self, package: str, snapshot_name: str) -> Tuple[bool, str]:
+        tar_file = DEFAULT_SNAPSHOT_DIR / snapshot_name
+        if not tar_file.exists():
+            return False, f"Không tìm thấy file snapshot: {snapshot_name}"
 
-    @staticmethod
-    def create_database(cookie_value: str, db_path: Path) -> None:
-        if db_path.exists():
-            db_path.unlink()
-        
-        # Chromium timestamps are microseconds since Windows epoch (Jan 1, 1601 UTC)
-        # Windows Epoch difference: 11644473600 seconds
-        now_micro = int((time.time() + 11644473600) * 1000000)
-        expires_micro = int((time.time() + 11644473600 + (86400 * 365 * 2)) * 1000000)
+        script = f"""
+pkg="{package}"
+app_dir="/data/data/$pkg"
+if [ ! -d "$app_dir" ] && [ -d "/data/user/0/$pkg" ]; then
+    app_dir="/data/user/0/$pkg"
+fi
 
-        conn = sqlite3.connect(str(db_path))
-        cursor = conn.cursor()
+am force-stop "$pkg" 2>/dev/null
+killall -9 "$pkg" 2>/dev/null
 
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS meta(key LONGVARCHAR NOT NULL UNIQUE PRIMARY KEY, value LONGVARCHAR);
-        """)
-        cursor.execute("INSERT OR REPLACE INTO meta VALUES('version', '18');")
-        cursor.execute("INSERT OR REPLACE INTO meta VALUES('last_compatible_version', '18');")
+owner=$(stat -c '%u:%g' "$app_dir" 2>/dev/null)
+if [ -z "$owner" ]; then
+    owner="1000:1000"
+fi
 
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS cookies(
-                creation_utc INTEGER NOT NULL,
-                host_key TEXT NOT NULL,
-                top_frame_site_key TEXT NOT NULL DEFAULT '',
-                name TEXT NOT NULL,
-                value TEXT NOT NULL,
-                encrypted_value BLOB NOT NULL DEFAULT x'',
-                path TEXT NOT NULL,
-                expires_utc INTEGER NOT NULL,
-                is_secure INTEGER NOT NULL,
-                is_httponly INTEGER NOT NULL,
-                last_access_utc INTEGER NOT NULL,
-                has_expires INTEGER NOT NULL,
-                is_persistent INTEGER NOT NULL,
-                priority INTEGER NOT NULL,
-                samesite INTEGER NOT NULL,
-                source_scheme INTEGER NOT NULL,
-                source_port INTEGER NOT NULL DEFAULT -1,
-                is_same_party INTEGER NOT NULL DEFAULT 0,
-                last_update_utc INTEGER NOT NULL DEFAULT 0
-            );
-        """)
+rm -rf "$app_dir"/* "$app_dir"/.* 2>/dev/null || true
+tar -xzf "{tar_file}" -C "$app_dir"
+chown -R "$owner" "$app_dir"
 
-        cursor.execute("""
-            INSERT INTO cookies VALUES(
-                ?, '.roblox.com', '', '.ROBLOSECURITY', ?, x'', '/', ?, 1, 1, ?, 1, 1, 1, -1, 2, 443, 0, ?
-            );
-        """, (now_micro, cookie_value, expires_micro, now_micro, now_micro))
+if [ -x /system/bin/restorecon ]; then
+    /system/bin/restorecon -RF "$app_dir" >/dev/null 2>&1 || true
+fi
+"""
+        res = self.backend.run(["sh", "-c", script], timeout=40)
+        if res.ok:
+            return True, f"Đã khôi phục thành công phiên đăng nhập: {snapshot_name}"
+        return False, f"Lỗi khôi phục: {_compact(res.output)}"
 
-        conn.commit()
-        conn.close()
+    def list_snapshots(self) -> List[str]:
+        if not DEFAULT_SNAPSHOT_DIR.exists():
+            return []
+        return sorted([f.name for f in DEFAULT_SNAPSHOT_DIR.glob("*.tar.gz")])
 
 
 @dataclasses.dataclass(frozen=True)
@@ -768,7 +713,7 @@ class RobloxLaunchSpec:
     def is_valid(self) -> bool:
         return bool(self.place_id or _is_roblox_url(self.raw))
 
-    def candidate_urls(self, ticket: Optional[str] = None) -> List[str]:
+    def candidate_urls(self) -> List[str]:
         candidates: List[str] = []
         if self.place_id:
             params: Dict[str, str] = {"placeId": self.place_id}
@@ -778,19 +723,11 @@ class RobloxLaunchSpec:
                 params["accessCode"] = self.access_code
             elif self.link_code:
                 params["linkCode"] = self.link_code
-            if ticket:
-                params["ticket"] = ticket
             encoded = urllib.parse.urlencode(params)
             candidates.append("roblox://" + encoded)
             candidates.append("roblox://experiences/start?" + encoded)
         if _is_roblox_url(self.raw):
-            raw_target = self.raw
-            if ticket:
-                sep = "&" if "?" in raw_target else "?"
-                raw_target += f"{sep}ticket={urllib.parse.quote(ticket)}"
-            candidates.append(raw_target)
-        if ticket:
-            candidates.append(f"https://www.roblox.com/Login/Negotiate.ashx?suggest={urllib.parse.quote(ticket)}")
+            candidates.append(self.raw)
         return list(dict.fromkeys(candidates))
 
 
@@ -803,186 +740,6 @@ def _is_roblox_url(value: str) -> bool:
         return False
     host = (parsed.hostname or "").lower()
     return host == "roblox.com" or host.endswith(".roblox.com") or host == "ro.blox.com"
-
-
-class CookieStore:
-    @classmethod
-    def normalize_record(cls, raw_record: str) -> str:
-        value = str(raw_record).strip()
-        lowered = value.lower()
-        is_raw_cookie = value.startswith("_|WARNING:")
-        is_cookie_header = lowered.startswith(".roblosecurity=") or lowered.startswith("cookie:")
-        if not is_raw_cookie and not is_cookie_header:
-            fields = value.split(":", 2)
-            if len(fields) == 3 and len(fields[2].strip()) >= 50:
-                value = fields[2].strip()
-        return cls.normalize(value)
-
-    @staticmethod
-    def normalize(raw_cookie: str) -> str:
-        value = str(raw_cookie).strip().strip("'\"")
-        value = re.sub(r"\\([_.|\-])", r"\1", value)
-        header_match = re.search(r"(?i)(?:^|[;\s])\.ROBLOSECURITY\s*=\s*([^;\s]+)", value)
-        if header_match:
-            value = header_match.group(1).strip()
-        if any(character in value for character in ("\x00", "\r", "\n")):
-            raise ConfigError("Cookie chứa ký tự điều khiển không hợp lệ")
-        if len(value) < 50:
-            raise ConfigError("Cookie quá ngắn hoặc không đúng định dạng")
-        return value
-
-    @classmethod
-    def load(cls, path: Path, packages: Sequence[str]) -> Dict[str, str]:
-        if not path.exists():
-            raise ConfigError(f"Không tìm thấy file: {path}. Hãy tạo file và dán cookie vào!")
-        try:
-            content = path.read_text(encoding="utf-8")
-        except OSError as exc:
-            raise ConfigError(f"Không đọc được file cookie {path}: {exc}") from exc
-
-        mapping: Dict[str, str] = {}
-        try:
-            decoded = json.loads(content)
-        except json.JSONDecodeError:
-            decoded = None
-
-        if isinstance(decoded, dict):
-            raw_mapping = decoded.get("cookies", decoded)
-            if isinstance(raw_mapping, dict):
-                for package, cookie in raw_mapping.items():
-                    package_text = str(package).strip()
-                    if PACKAGE_RE.fullmatch(package_text) and isinstance(cookie, str):
-                        mapping[package_text] = cls.normalize_record(cookie)
-        else:
-            lines = [
-                line.strip()
-                for line in content.splitlines()
-                if line.strip() and not line.lstrip().startswith("#")
-            ]
-            for package, cookie in zip(packages, lines):
-                mapping[package] = cls.normalize_record(cookie)
-
-        if not mapping:
-            raise ConfigError(f"Không có cookie hợp lệ trong {path}")
-        return mapping
-
-
-def validate_roblox_cookie(cookie: str, timeout: float = 10.0) -> Tuple[bool, str]:
-    try:
-        normalized = CookieStore.normalize(cookie)
-    except ConfigError as exc:
-        return False, str(exc)
-    request = urllib.request.Request(
-        "https://users.roblox.com/v1/users/authenticated",
-        headers={
-            "Cookie": f".ROBLOSECURITY={normalized}",
-            "Accept": "application/json",
-            "User-Agent": "SieuVipPro-Rejoin/1.0",
-        },
-        method="GET",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        if exc.code in {401, 403}:
-            return False, "Cookie bị Roblox từ chối hoặc đã hết hạn"
-        return False, f"Roblox trả về HTTP {exc.code} khi kiểm tra cookie"
-    except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError):
-        return False, "Không kết nối được Roblox để kiểm tra cookie"
-    user_id = payload.get("id") if isinstance(payload, dict) else None
-    username = payload.get("name") if isinstance(payload, dict) else None
-    if not user_id or not username:
-        return False, "Roblox không trả về tài khoản cho cookie này"
-    masked = str(username)
-    masked = ("*" * max(0, len(masked) - 3)) + masked[-3:]
-    return True, f"Cookie hợp lệ cho tài khoản {masked}"
-
-
-class CookieInstaller:
-    """Injects SQLite Chromium WebView Database directly into app directory."""
-
-    def __init__(
-        self,
-        backend: AndroidBackend,
-        logger: logging.Logger,
-        command_timeout: float,
-    ) -> None:
-        self.backend = backend
-        self.logger = logger
-        self.command_timeout = command_timeout
-
-    def apply(self, package: str, cookie: str) -> Tuple[bool, str]:
-        if not self.backend.can_write_app_data:
-            return False, "Inject cookie cần backend root/su"
-        if not PACKAGE_RE.fullmatch(package):
-            return False, "Package không hợp lệ"
-        try:
-            normalized = CookieStore.normalize(cookie)
-        except ConfigError as exc:
-            return False, str(exc)
-
-        # 1. Tạo file SQLite database chuẩn
-        tmp_db = Path("/sdcard/Download/temp_roblox_cookies.db")
-        try:
-            SQLiteCookieInjector.create_database(normalized, tmp_db)
-        except Exception as exc:
-            return False, f"Không tạo được SQLite Database: {exc}"
-
-        c = normalized
-        if not c.startswith("_|WARNING:-DO-NOT-SHARE-THIS"):
-            c = "_|WARNING:-DO-NOT-SHARE-THIS.--Sharing-this-will-allow-someone-to-log-into-your-account-and-rob-your-robox.--|_" + c
-
-        # 2. Đẩy SQLite DB và XML Session vào app directory
-        script = f"""
-pkg="{package}"
-app_dir="/data/data/$pkg"
-if [ ! -d "$app_dir" ] && [ -d "/data/user/0/$pkg" ]; then
-    app_dir="/data/user/0/$pkg"
-fi
-
-am force-stop "$pkg" 2>/dev/null
-killall -9 "$pkg" 2>/dev/null
-
-owner=$(stat -c '%u:%g' "$app_dir" 2>/dev/null)
-if [ -z "$owner" ]; then
-    owner="1000:1000"
-fi
-
-# Tạo các đường dẫn Chromium WebView Cookies
-mkdir -p "$app_dir/app_webview/Default/Network"
-mkdir -p "$app_dir/app_webview/Default"
-mkdir -p "$app_dir/shared_prefs"
-
-# Chép SQLite DB vào cả 2 cấu trúc thư mục WebView mới và cũ
-cp -f "{tmp_db}" "$app_dir/app_webview/Default/Network/Cookies"
-cp -f "{tmp_db}" "$app_dir/app_webview/Default/Cookies"
-cp -f "{tmp_db}" "$app_dir/app_webview/Cookies" 2>/dev/null || true
-
-# Tạo thêm XML dự phòng
-cat << 'EOF' > "$app_dir/shared_prefs/com.roblox.client_preferences.xml"
-<?xml version='1.0' encoding='utf-8' standalone='yes' ?>
-<map>
-    <string name="RBXSession">{c}</string>
-    <string name="RBXSessionToken">{c}</string>
-</map>
-EOF
-
-chown -R "$owner" "$app_dir/app_webview" "$app_dir/shared_prefs"
-chmod 700 "$app_dir/app_webview" "$app_dir/app_webview/Default" "$app_dir/app_webview/Default/Network"
-chmod 600 "$app_dir/app_webview/Default/Network/Cookies" "$app_dir/app_webview/Default/Cookies" 2>/dev/null || true
-chmod 771 "$app_dir/shared_prefs"
-chmod 660 "$app_dir/shared_prefs/com.roblox.client_preferences.xml"
-
-if [ -x /system/bin/restorecon ]; then
-    /system/bin/restorecon -RF "$app_dir" >/dev/null 2>&1 || true
-fi
-"""
-        write_result = self.backend.run(["sh", "-c", script], timeout=self.command_timeout)
-        tmp_db.unlink(missing_ok=True)
-        if not write_result.ok:
-            return False, f"Lỗi inject: {_compact(write_result.output)}"
-        return True, "Đã bơm SQLite Cookie Database vào app thành công"
 
 
 class AndroidController:
@@ -1032,11 +789,7 @@ class AndroidController:
         result = self.backend.run(["am", "force-stop", package], timeout=self.command_timeout)
         return self.command_accepted(result), result.output
 
-    def start_lobby(self, package: str, ticket: Optional[str] = None) -> Tuple[bool, str]:
-        if ticket:
-            spec = RobloxLaunchSpec.parse(DEFAULT_BLOX_FRUITS_PLACE_ID)
-            return self.start_deep_link(package, spec, freeform=False, bounds=None, ticket=ticket)
-
+    def start_lobby(self, package: str) -> Tuple[bool, str]:
         result = self.backend.run(
             [
                 "am",
@@ -1060,9 +813,8 @@ class AndroidController:
         *,
         freeform: bool,
         bounds: Optional[str],
-        ticket: Optional[str] = None,
     ) -> Tuple[bool, str]:
-        if not spec.is_valid() and not ticket:
+        if not spec.is_valid():
             return False, "Link/Place ID không hợp lệ"
 
         option_variants: List[List[str]] = []
@@ -1074,7 +826,7 @@ class AndroidController:
 
         errors: List[str] = []
         component = f"{package}/{self.PROTOCOL_ACTIVITY}"
-        for url in spec.candidate_urls(ticket=ticket):
+        for url in spec.candidate_urls():
             for options in option_variants:
                 intents = (
                     [
@@ -1168,14 +920,10 @@ class RejoinEngine:
         config: RejoinConfig,
         controller: AndroidController,
         logger: logging.Logger,
-        cookie_installer: Optional[CookieInstaller] = None,
-        cookies: Optional[Dict[str, str]] = None,
     ) -> None:
         self.config = config
         self.controller = controller
         self.logger = logger
-        self.cookie_installer = cookie_installer
-        self.cookies = cookies or {}
         self.stop_requested = False
         self._ping_paths: Dict[str, str] = {}
 
@@ -1333,15 +1081,6 @@ class RejoinEngine:
         self.controller.force_stop(target.package)
         self._sleep(0.5)
 
-        ticket = None
-        cookie = self.cookies.get(target.package)
-        if self.config.auto_login_cookies and cookie:
-            if self.cookie_installer:
-                self.cookie_installer.apply(target.package, cookie)
-            t_val, _ = RobloxAuth.generate_auth_ticket(cookie)
-            if t_val:
-                ticket = t_val
-
         if force_rejoin:
             opened, _ = self.controller.start_lobby(target.package)
             if opened:
@@ -1363,7 +1102,6 @@ class RejoinEngine:
                 spec,
                 freeform=self.config.freeform or self.config.auto_arrange,
                 bounds=bounds,
-                ticket=ticket,
             )
             if accepted:
                 healthy, health_detail = self._wait_for_target_health(target, join_started)
@@ -1513,45 +1251,66 @@ def _configure_menu_links(config: RejoinConfig, config_path: Path) -> None:
     print("\n[+] Đã áp dụng Server Link cho tất cả package.")
 
 
-def _login_cookie_menu(
+def _snapshot_menu(
     config: RejoinConfig,
-    controller: AndroidController,
     backend: AndroidBackend,
-    cookie_path: Path,
     logger: logging.Logger,
-) -> int:
-    if not config.targets:
-        raise ConfigError("Chưa có package nào được chọn. Hãy chọn ở mục 3.")
-    packages = [t.package for t in config.targets]
-    cookies = CookieStore.load(cookie_path, packages)
-    installer = CookieInstaller(backend, logger, config.command_timeout_seconds)
-    succeeded = 0
-    for target in config.targets:
-        c = cookies.get(target.package)
-        if not c:
-            continue
-        valid, val_msg = validate_roblox_cookie(c)
-        if not valid:
-            logger.error("[%s] Cookie lỗi: %s", target.package, val_msg)
-            continue
-        logger.info("[%s] %s", target.package, val_msg)
+) -> None:
+    manager = SnapshotManager(backend, logger)
+    while True:
+        print("\033[2J\033[H", end="")
+        print(f"📦 {Colors.CYAN}{Colors.BOLD}Trình Quản Lý Snapshot Tài Khoản (Hot-Swap){Colors.RESET}\n")
+        print("1. Sao lưu Session tài khoản hiện tại của App (Tạo Snapshot)")
+        print("2. Đăng nhập / Khôi phục Snapshot vào App")
+        print("3. Xem danh sách Snapshot đã lưu")
+        print("0. Quay lại")
 
-        # 1. Bơm SQLite Database trực tiếp vào phân vùng WebView
-        ok, msg = installer.apply(target.package, c)
-        if not ok:
-            logger.error("[%s] Lỗi SQLite Inject: %s", target.package, msg)
-            continue
-        logger.info("[%s] %s", target.package, msg)
-
-        # 2. Sinh SSO Auth Ticket và kích hoạt qua Deep Link
-        ticket, _ = RobloxAuth.generate_auth_ticket(c)
-        spec = RobloxLaunchSpec.parse(target.link)
-        controller.start_deep_link(target.package, spec, freeform=False, bounds=None, ticket=ticket)
-        succeeded += 1
-        time.sleep(2.0)
-
-    logger.info("Đã hoàn tất nạp SQLite Cookie cho %d/%d package", succeeded, len(config.targets))
-    return 0
+        choice = input("\nChọn thao tác [0-3]: ").strip()
+        if choice == "0":
+            break
+        elif choice == "1":
+            if not config.targets:
+                print(f"{Colors.RED}Chưa chọn package. Vào mục 3 trước!{Colors.RESET}")
+                time.sleep(1.5)
+                continue
+            print("\nChọn package muốn sao lưu session:")
+            for idx, t in enumerate(config.targets, start=1):
+                print(f"  {idx}. {t.package}")
+            pkg_idx = input("Nhập số: ").strip()
+            if pkg_idx.isdigit() and 1 <= int(pkg_idx) <= len(config.targets):
+                target_pkg = config.targets[int(pkg_idx) - 1].package
+                acc_name = input("Đặt tên cho tài khoản này (ví dụ: acc_chinh, bot1): ").strip()
+                if acc_name:
+                    ok, msg = manager.backup_account(target_pkg, acc_name)
+                    print(f"\n{Colors.GREEN if ok else Colors.RED}{msg}{Colors.RESET}")
+            input("\nNhấn Enter để tiếp tục...")
+        elif choice == "2":
+            snaps = manager.list_snapshots()
+            if not snaps:
+                print(f"{Colors.YELLOW}Chưa có file snapshot nào được tạo!{Colors.RESET}")
+                input("\nNhấn Enter để tiếp tục...")
+                continue
+            print("\nDanh sách tài khoản đã sao lưu:")
+            for idx, s in enumerate(snaps, start=1):
+                print(f"  {idx}. {s}")
+            s_idx = input("Chọn số snapshot để nạp: ").strip()
+            if s_idx.isdigit() and 1 <= int(s_idx) <= len(snaps):
+                selected_snap = snaps[int(s_idx) - 1]
+                print("\nChọn package muốn nạp tài khoản này vào:")
+                for idx, t in enumerate(config.targets, start=1):
+                    print(f"  {idx}. {t.package}")
+                pkg_idx = input("Nhập số: ").strip()
+                if pkg_idx.isdigit() and 1 <= int(pkg_idx) <= len(config.targets):
+                    target_pkg = config.targets[int(pkg_idx) - 1].package
+                    ok, msg = manager.restore_account(target_pkg, selected_snap)
+                    print(f"\n{Colors.GREEN if ok else Colors.RED}{msg}{Colors.RESET}")
+            input("\nNhấn Enter để tiếp tục...")
+        elif choice == "3":
+            snaps = manager.list_snapshots()
+            print(f"\nDanh sách Snapshot ({DEFAULT_SNAPSHOT_DIR}):")
+            for s in snaps:
+                print(f" - {s}")
+            input("\nNhấn Enter để tiếp tục...")
 
 
 def _config_menu(config: RejoinConfig, config_path: Path) -> None:
@@ -1580,7 +1339,6 @@ def _config_menu(config: RejoinConfig, config_path: Path) -> None:
 
 def interactive_menu(
     config_path: Path,
-    cookie_source: Path,
     requested_backend: str,
     adb_serial: Optional[str],
     logger: logging.Logger,
@@ -1597,7 +1355,7 @@ def interactive_menu(
         print(f"│ {Colors.MAGENTA}   2{Colors.RESET}  │ {Colors.CYAN}Nhập Game ID / Link Server VIP                         {Colors.RESET}│")
         print(f"│ {Colors.MAGENTA}   3{Colors.RESET}  │ {Colors.CYAN}Chọn Package Roblox để chạy                            {Colors.RESET}│")
         print(f"│ {Colors.MAGENTA}   4{Colors.RESET}  │ {Colors.CYAN}Mở tất cả App lên nền (Warm-up)                        {Colors.RESET}│")
-        print(f"│ {Colors.MAGENTA}   5{Colors.RESET}  │ {Colors.CYAN}Login Cookie qua SQLite DB & SSO Negotiate             {Colors.RESET}│")
+        print(f"│ {Colors.MAGENTA}   5{Colors.RESET}  │ {Colors.CYAN}Quản lý Snapshot / Hot-Swap Tài Khoản (Đăng nhập tức thì){Colors.RESET}│")
         print(f"│ {Colors.MAGENTA}  13{Colors.RESET}  │ {Colors.GREEN}Cấu hình Nâng cao (Grid / Heartbeat Watchdog)          {Colors.RESET}│")
         print(f"│ {Colors.MAGENTA}   0{Colors.RESET}  │ {Colors.RED}Thoát Hệ Thống                                         {Colors.RESET}│")
         print("└──────┴────────────────────────────────────────────────────────┘")
@@ -1618,7 +1376,7 @@ def interactive_menu(
                 for t in config.targets:
                     controller.start_lobby(t.package)
             elif choice == "5":
-                _login_cookie_menu(config, controller, backend, cookie_source, logger)
+                _snapshot_menu(config, backend, logger)
             elif choice == "13":
                 _config_menu(config, config_path)
         except Exception as exc:
@@ -1630,7 +1388,6 @@ def interactive_menu(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Roblox Auto Rejoin Engine")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
-    parser.add_argument("--cookies", type=Path, default=DEFAULT_COOKIE_SOURCE_PATH)
     parser.add_argument("--backend", default="auto", choices=("auto", "direct", "su", "adb", "soft"))
     parser.add_argument("--adb-serial", help="ADB serial")
     parser.add_argument("--verbose", action="store_true")
@@ -1647,7 +1404,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     args = build_parser().parse_args(argv)
     logger = setup_logger(DEFAULT_LOG_PATH, verbose=args.verbose)
-    return interactive_menu(args.config, args.cookies, args.backend, args.adb_serial, logger)
+    return interactive_menu(args.config, args.backend, args.adb_serial, logger)
 
 
 if __name__ == "__main__":
