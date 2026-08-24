@@ -1,31 +1,3 @@
-#!/data/data/com.termux/files/usr/bin/bash
-# One-command bootstrap:
-# . <(curl -fsSL RAW_URL/toiday)
-_svr_setup_main() {
-    local engine_url
-    local expected_sha256
-    local python_bin
-    local su_bin
-    local root_uid
-    local cache_dir
-    local engine_file
-    local temporary_file
-    local actual_sha256
-    local config_file
-    local cookie_store
-    local legacy_cookie_file
-    local step_status
-    engine_url="${SIEUVIP_REJOIN_URL:-https://raw.githubusercontent.com/TenKoCo/sieuvip/refs/heads/main/sieuvip.py}"
-    expected_sha256="${SIEUVIP_REJOIN_SHA256:-92a2f64714fe81a4baa4892792392f4c52539560d1322d7fa3f675edc174bcc2}"
-    cache_dir="${XDG_DATA_HOME:-${HOME}/.local/share}/sieuvip-rejoin"
-    engine_file="${cache_dir}/sieuvip.py"
-    temporary_file="${engine_file}.download.$$"
-    config_file="${HOME}/.config/sieuvip-rejoin/config.json"
-    cookie_store="${HOME}/.config/sieuvip-rejoin/cookies.json"
-    legacy_cookie_file="/sdcard/Download/cookie.txt"
-    printf '\n%s\n' '========== SieuVip Rejoin · Termux =========='
-    if ! command -v curl >/dev/null 2>&1; then
-        printf '%s\n' '[!] Chưa có curl. Hãy chạy: pkg install curl' >&2
         return 127
     fi
     python_bin="$(command -v python 2>/dev/null || true)"
@@ -84,3 +56,55 @@ _svr_setup_main() {
             rm -f "${temporary_file}"
             printf '%s\n' '[!] SHA-256 không khớp; từ chối chạy file không đúng bản.' >&2
             return 1
+        fi
+        printf '%s\n' '[+] SHA-256: OK'
+    fi
+    if ! "${python_bin}" -c \
+        'import ast,pathlib,sys; ast.parse(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))' \
+        "${temporary_file}"; then
+        rm -f "${temporary_file}"
+        printf '%s\n' '[!] Engine tải về không phải Python hợp lệ.' >&2
+        return 1
+    fi
+    chmod 600 "${temporary_file}" || true
+    if ! mv -f "${temporary_file}" "${engine_file}"; then
+        rm -f "${temporary_file}"
+        printf '%s\n' '[!] Không cài được engine.' >&2
+        return 1
+    fi
+    printf '%s\n' '[+] Engine: sẵn sàng'
+    # Nếu truyền tham số sau lệnh source, chuyển nguyên vẹn cho engine.
+    if [ "$#" -gt 0 ]; then
+        "${python_bin}" "${engine_file}" "$@"
+        return $?
+    fi
+    # Lần đầu tự mở trình tạo config.
+    if [ ! -f "${config_file}" ]; then
+        printf '%s\n' '[*] Lần chạy đầu: tạo cấu hình...'
+        "${python_bin}" "${engine_file}" \
+            --config "${config_file}" \
+            --cookies "${cookie_store}" \
+            --backend su init
+        step_status=$?
+        if [ "${step_status}" -ne 0 ]; then
+            return "${step_status}"
+        fi
+    fi
+    # Tự import cookie.txt cũ nếu kho private chưa tồn tại.
+    if [ -f "${legacy_cookie_file}" ] && [ ! -f "${cookie_store}" ]; then
+        printf '%s\n' '[*] Phát hiện cookie.txt; đang import an toàn...'
+        "${python_bin}" "${engine_file}" \
+            --config "${config_file}" \
+            --cookies "${cookie_store}" \
+            import-cookies "${legacy_cookie_file}" || return $?
+    fi
+    printf '%s\n' '[*] Khởi động auto rejoin...'
+    "${python_bin}" "${engine_file}" \
+        --config "${config_file}" \
+        --cookies "${cookie_store}" \
+        --backend su run
+}
+_svr_setup_main "$@"
+_svr_setup_status=$?
+unset -f _svr_setup_main 2>/dev/null || true
+return "${_svr_setup_status}" 2>/dev/null || exit "${_svr_setup_status}"
