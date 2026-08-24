@@ -1322,13 +1322,22 @@ class RejoinEngine:
                 len(enabled),
                 elapsed,
             )
-            if once or self.config.interval_seconds <= 0 or self.stop_requested:
+            if once or self.stop_requested:
                 break
-            wait_seconds = self.config.interval_seconds
             if monitor_mode:
-                wait_seconds = min(wait_seconds, HEALTH_POLL_SECONDS)
+                # Config cũ thường dùng interval=0 với nghĩa "rejoin một lần".
+                # Trong chế độ monitor, 0 vẫn phải tiếp tục check để có thể mở
+                # lại package sau khi app bị tắt.
+                wait_seconds = (
+                    HEALTH_POLL_SECONDS
+                    if self.config.interval_seconds <= 0
+                    else min(self.config.interval_seconds, HEALTH_POLL_SECONDS)
+                )
                 self._sleep(wait_seconds)
             else:
+                if self.config.interval_seconds <= 0:
+                    break
+                wait_seconds = self.config.interval_seconds
                 self._wait_for_next_cycle(wait_seconds)
         self.logger.info("Auto rejoin đã dừng")
         return 0
@@ -1548,16 +1557,42 @@ class RejoinEngine:
 
     def _resolve_bounds(self, targets: List[TargetConfig]) -> List[Optional[str]]:
         configured = [target.bounds for target in targets]
-        if not self.config.auto_arrange:
-            if self.config.freeform:
-                return [value or "0,0,600,800" for value in configured]
+        if not self.config.auto_arrange and not self.config.freeform:
             return configured
 
         width, height = self.controller.get_screen_size()
-        columns = math.ceil(math.sqrt(len(targets)))
+        count = max(1, len(targets))
+        # Cửa sổ Roblox dạng dọc cần đủ rộng để Android không tự phóng lớn lại.
+        # Thiết bị rộng hơn sẽ chứa nhiều cột hơn, tối đa 6 như layout mẫu.
+        minimum_window_width = 220
+        maximum_columns = max(1, min(6, width // minimum_window_width))
+        columns = min(count, maximum_columns)
         rows = math.ceil(len(targets) / columns)
         cell_width = width // columns
-        cell_height = height // rows
+        cell_height = height // max(1, rows)
+        margin = max(4, min(16, width // 200))
+        responsive_width = max(1, cell_width - (margin * 2))
+        preferred_height = max(320, int(responsive_width * 1.65))
+
+        if not self.config.auto_arrange:
+            # Auto sort: thu nhỏ dựa trên width và xếp lệch nhẹ để vẫn nhận ra
+            # từng tab. Option auto_arrange bên dưới mới chia lưới hoàn chỉnh.
+            window_height = min(height - (margin * 2), preferred_height)
+            max_left = max(0, width - responsive_width - margin)
+            max_top = max(0, height - window_height - margin)
+            cascade = max(18, width // 50)
+            sorted_bounds: List[Optional[str]] = []
+            for index, target in enumerate(targets):
+                if target.bounds:
+                    sorted_bounds.append(target.bounds)
+                    continue
+                left = margin + min(max_left, index * cascade)
+                top = margin + min(max_top, index * cascade)
+                right = min(width, left + responsive_width)
+                bottom = min(height, top + window_height)
+                sorted_bounds.append(f"{left},{top},{right},{bottom}")
+            return sorted_bounds
+
         result: List[Optional[str]] = []
         for index, target in enumerate(targets):
             if target.bounds:
@@ -1565,9 +1600,16 @@ class RejoinEngine:
                 continue
             column = index % columns
             row = index // columns
-            left, top = column * cell_width, row * cell_height
-            right = width if column == columns - 1 else left + cell_width
-            bottom = height if row == rows - 1 else top + cell_height
+            cell_left = column * cell_width
+            cell_top = row * cell_height
+            cell_right = width if column == columns - 1 else cell_left + cell_width
+            cell_bottom = height if row == rows - 1 else cell_top + cell_height
+            left = cell_left + margin
+            top = cell_top + margin
+            right = max(left + 1, cell_right - margin)
+            bottom = min(cell_bottom - margin, top + preferred_height)
+            if bottom <= top:
+                bottom = min(height, top + 1)
             result.append(f"{left},{top},{right},{bottom}")
         return result
 
@@ -1760,14 +1802,32 @@ def login_cookies(
     backend: AndroidBackend,
     cookie_path: Path,
     logger: logging.Logger,
+    selected_packages: Optional[Sequence[str]] = None,
 ) -> int:
     if not backend.can_write_app_data:
         raise BackendError("Đăng nhập cookie cần backend root/su")
-    targets = [target for target in config.targets if target.enabled]
-    if not targets:
+    all_targets = [target for target in config.targets if target.enabled]
+    if not all_targets:
         raise ConfigError("Chưa chọn package. Hãy dùng chức năng 3 trước.")
-    packages = [target.package for target in targets]
-    cookies = CookieStore.load(cookie_path, packages)
+    all_packages = [target.package for target in all_targets]
+    # Luôn ghép từng dòng cookie với toàn bộ danh sách package trước khi lọc.
+    # Nhờ vậy chọn package số 2 vẫn nhận cookie dòng số 2, không bị lệch dòng.
+    cookies = CookieStore.load(cookie_path, all_packages)
+    if selected_packages is None:
+        targets = all_targets
+    else:
+        requested = set(selected_packages)
+        unknown = requested.difference(all_packages)
+        if unknown:
+            raise ConfigError(
+                "Package được chọn không có trong chức năng 3: "
+                + ", ".join(sorted(unknown))
+            )
+        targets = [
+            target for target in all_targets if target.package in requested
+        ]
+        if not targets:
+            raise ConfigError("Bạn chưa chọn package để đăng nhập")
     harden_cookie_file(cookie_path, logger)
     installer = CookieInstaller(backend, logger, config.command_timeout_seconds)
     succeeded = 0
@@ -1976,6 +2036,44 @@ def _run_menu_rejoin(
         signal.signal(signal.SIGTERM, old_sigterm)
 
 
+def _login_cookie_menu(
+    config: RejoinConfig,
+    controller: AndroidController,
+    backend: AndroidBackend,
+    cookie_path: Path,
+    logger: logging.Logger,
+) -> int:
+    targets = _require_menu_targets(config)
+    print("\n1. Login to all package")
+    print("2. Login to choose package")
+    choice = input("Chọn cách đăng nhập [1/2]: ").strip()
+    if choice == "1":
+        return login_cookies(
+            config, controller, backend, cookie_path, logger
+        )
+    if choice != "2":
+        raise ConfigError("Chỉ chấp nhận lựa chọn 1 hoặc 2")
+
+    packages = [target.package for target in targets]
+    print("\nCác package đã chọn ở chức năng 3:")
+    for index, package in enumerate(packages, start=1):
+        print(f"  {index}. {package}")
+    raw_selection = input(
+        "Nhập số package, nhiều số cách nhau bằng dấu phẩy: "
+    )
+    selected = _parse_selection(raw_selection, packages)
+    if not selected:
+        raise ConfigError("Bạn chưa chọn package để đăng nhập")
+    return login_cookies(
+        config,
+        controller,
+        backend,
+        cookie_path,
+        logger,
+        selected_packages=selected,
+    )
+
+
 def _health_method_menu_label(config: RejoinConfig) -> str:
     return {
         "online": "Check Online (tiến trình Android)",
@@ -2114,7 +2212,7 @@ def interactive_menu(
                 _open_selected_apps(config, controller, logger)
             elif choice == "5":
                 backend, controller = get_android()
-                login_cookies(
+                _login_cookie_menu(
                     config, controller, backend, cookie_source, logger
                 )
             elif choice == "13":
