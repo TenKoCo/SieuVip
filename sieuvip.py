@@ -591,6 +591,67 @@ def _select_adb_device(adb_path: str, requested_serial: Optional[str]) -> Option
     return devices[0] if len(devices) == 1 else None
 
 
+class RobloxAuth:
+    """Handles Roblox Authentication Ticket exchange from .ROBLOSECURITY cookies."""
+
+    @staticmethod
+    def get_csrf_token(cookie: str) -> Optional[str]:
+        req = urllib.request.Request(
+            "https://auth.roblox.com/v1/authentication-ticket/",
+            data=b"{}",
+            headers={
+                "Cookie": f".ROBLOSECURITY={cookie}",
+                "Content-Type": "application/json",
+                "User-Agent": "Roblox/Android",
+                "Referer": "https://www.roblox.com/",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return resp.headers.get("x-csrf-token")
+        except urllib.error.HTTPError as exc:
+            return exc.headers.get("x-csrf-token")
+        except Exception:
+            return None
+
+    @staticmethod
+    def generate_auth_ticket(cookie: str) -> Tuple[Optional[str], str]:
+        csrf = RobloxAuth.get_csrf_token(cookie)
+        if not csrf:
+            return None, "Không lấy được CSRF Token từ Roblox API"
+
+        req = urllib.request.Request(
+            "https://auth.roblox.com/v1/authentication-ticket/",
+            data=b"{}",
+            headers={
+                "Cookie": f".ROBLOSECURITY={cookie}",
+                "Content-Type": "application/json",
+                "User-Agent": "Roblox/Android",
+                "Referer": "https://www.roblox.com/",
+                "x-csrf-token": csrf,
+                "RBXAuthenticationNegotiation": "1",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                ticket = resp.headers.get("rbx-authentication-ticket")
+                if ticket:
+                    return ticket.strip(), "OK"
+                try:
+                    payload = json.loads(resp.read().decode())
+                    if "ticket" in payload:
+                        return str(payload["ticket"]).strip(), "OK"
+                except Exception:
+                    pass
+                return None, "Roblox không trả về Auth Ticket"
+        except urllib.error.HTTPError as exc:
+            return None, f"Lỗi sinh Ticket HTTP {exc.code}"
+        except Exception as exc:
+            return None, f"Lỗi kết nối sinh Ticket: {exc}"
+
+
 @dataclasses.dataclass(frozen=True)
 class RobloxLaunchSpec:
     raw: str
@@ -652,7 +713,7 @@ class RobloxLaunchSpec:
     def is_valid(self) -> bool:
         return bool(self.place_id or _is_roblox_url(self.raw))
 
-    def candidate_urls(self) -> List[str]:
+    def candidate_urls(self, ticket: Optional[str] = None) -> List[str]:
         candidates: List[str] = []
         if self.place_id:
             params: Dict[str, str] = {"placeId": self.place_id}
@@ -662,11 +723,19 @@ class RobloxLaunchSpec:
                 params["accessCode"] = self.access_code
             elif self.link_code:
                 params["linkCode"] = self.link_code
+            if ticket:
+                params["ticket"] = ticket
             encoded = urllib.parse.urlencode(params)
             candidates.append("roblox://" + encoded)
             candidates.append("roblox://experiences/start?" + encoded)
         if _is_roblox_url(self.raw):
-            candidates.append(self.raw)
+            raw_target = self.raw
+            if ticket:
+                sep = "&" if "?" in raw_target else "?"
+                raw_target += f"{sep}ticket={urllib.parse.quote(ticket)}"
+            candidates.append(raw_target)
+        if not candidates and ticket:
+            candidates.append(f"roblox://navigation/home?ticket={urllib.parse.quote(ticket)}")
         return list(dict.fromkeys(candidates))
 
 
@@ -776,7 +845,7 @@ def validate_roblox_cookie(cookie: str, timeout: float = 10.0) -> Tuple[bool, st
 
 
 class CookieInstaller:
-    """Deep injection of RBXSession + Cache Cleanup + UID Ownership + SELinux Restore."""
+    """Injects session and uses Auth Ticket handshake."""
 
     def __init__(
         self,
@@ -802,7 +871,6 @@ class CookieInstaller:
         if not c.startswith("_|WARNING:-DO-NOT-SHARE-THIS"):
             c = "_|WARNING:-DO-NOT-SHARE-THIS.--Sharing-this-will-allow-someone-to-log-into-your-account-and-rob-your-robox.--|_" + c
 
-        # Script xử lý tầng sâu: Dọn cache, gán XML, sửa UID/GID và khôi phục SELinux
         script = f"""
 pkg="{package}"
 app_dir="/data/data/$pkg"
@@ -810,23 +878,17 @@ if [ ! -d "$app_dir" ] && [ -d "/data/user/0/$pkg" ]; then
     app_dir="/data/user/0/$pkg"
 fi
 
-# 1. Dừng app hoàn toàn
 am force-stop "$pkg" 2>/dev/null
 killall -9 "$pkg" 2>/dev/null
 
-# 2. Lấy UID và GID sở hữu của App
 owner=$(stat -c '%u:%g' "$app_dir" 2>/dev/null)
 if [ -z "$owner" ]; then
     owner="1000:1000"
 fi
 
-# 3. Dọn dẹp cache / database / webview cũ (nguyên nhân gây đè cookie)
 rm -rf "$app_dir/app_webview" "$app_dir/cache" "$app_dir/code_cache" "$app_dir/databases" "$app_dir/files/GuestData" 2>/dev/null
-
-# 4. Tạo thư mục shared_prefs chuẩn
 mkdir -p "$app_dir/shared_prefs"
 
-# 5. Ghi thẳng XML Session
 cat << 'EOF' > "$app_dir/shared_prefs/com.roblox.client_preferences.xml"
 <?xml version='1.0' encoding='utf-8' standalone='yes' ?>
 <map>
@@ -835,7 +897,6 @@ cat << 'EOF' > "$app_dir/shared_prefs/com.roblox.client_preferences.xml"
 </map>
 EOF
 
-# 6. Phân quyền và khôi phục SELinux Context
 chown -R "$owner" "$app_dir/shared_prefs"
 chmod 771 "$app_dir/shared_prefs"
 chmod 660 "$app_dir/shared_prefs/com.roblox.client_preferences.xml"
@@ -847,7 +908,7 @@ fi
         write_result = self.backend.run(["sh", "-c", script], timeout=self.command_timeout)
         if not write_result.ok:
             return False, f"Lỗi inject: {_compact(write_result.output)}"
-        return True, "Đã inject cookie và đồng bộ SELinux thành công"
+        return True, "Đã chuẩn bị data & SELinux thành công"
 
 
 class AndroidController:
@@ -897,7 +958,11 @@ class AndroidController:
         result = self.backend.run(["am", "force-stop", package], timeout=self.command_timeout)
         return self.command_accepted(result), result.output
 
-    def start_lobby(self, package: str) -> Tuple[bool, str]:
+    def start_lobby(self, package: str, ticket: Optional[str] = None) -> Tuple[bool, str]:
+        if ticket:
+            spec = RobloxLaunchSpec.parse(DEFAULT_BLOX_FRUITS_PLACE_ID)
+            return self.start_deep_link(package, spec, freeform=False, bounds=None, ticket=ticket)
+
         result = self.backend.run(
             [
                 "am",
@@ -921,8 +986,9 @@ class AndroidController:
         *,
         freeform: bool,
         bounds: Optional[str],
+        ticket: Optional[str] = None,
     ) -> Tuple[bool, str]:
-        if not spec.is_valid():
+        if not spec.is_valid() and not ticket:
             return False, "Link/Place ID không hợp lệ"
 
         option_variants: List[List[str]] = []
@@ -934,7 +1000,7 @@ class AndroidController:
 
         errors: List[str] = []
         component = f"{package}/{self.PROTOCOL_ACTIVITY}"
-        for url in spec.candidate_urls():
+        for url in spec.candidate_urls(ticket=ticket):
             for options in option_variants:
                 intents = (
                     [
@@ -1193,10 +1259,17 @@ class RejoinEngine:
         self.controller.force_stop(target.package)
         self._sleep(0.5)
 
-        if self.config.auto_login_cookies:
-            cookie = self.cookies.get(target.package)
-            if cookie and self.cookie_installer:
+        ticket = None
+        cookie = self.cookies.get(target.package)
+        if self.config.auto_login_cookies and cookie:
+            if self.cookie_installer:
                 self.cookie_installer.apply(target.package, cookie)
+            t_val, msg = RobloxAuth.generate_auth_ticket(cookie)
+            if t_val:
+                ticket = t_val
+                self.logger.info("[%s] Đã sinh Auth Ticket đăng nhập thành công", target.package)
+            else:
+                self.logger.warning("[%s] Không sinh được Ticket (%s)", target.package, msg)
 
         if force_rejoin:
             opened, _ = self.controller.start_lobby(target.package)
@@ -1219,6 +1292,7 @@ class RejoinEngine:
                 spec,
                 freeform=self.config.freeform or self.config.auto_arrange,
                 bounds=bounds,
+                ticket=ticket,
             )
             if accepted:
                 healthy, health_detail = self._wait_for_target_health(target, join_started)
@@ -1390,13 +1464,19 @@ def _login_cookie_menu(
             logger.error("[%s] Cookie lỗi: %s", target.package, val_msg)
             continue
         logger.info("[%s] %s", target.package, val_msg)
-        ok, detail = installer.apply(target.package, c)
+
+        ticket, t_msg = RobloxAuth.generate_auth_ticket(c)
+        if not ticket:
+            logger.error("[%s] Không sinh được Auth Ticket: %s", target.package, t_msg)
+            continue
+
+        installer.apply(target.package, c)
+        logger.info("[%s] Đang mở app và truyền Auth Ticket...", target.package)
+        spec = RobloxLaunchSpec.parse(target.link)
+        ok, _ = controller.start_deep_link(target.package, spec, freeform=False, bounds=None, ticket=ticket)
         if ok:
             succeeded += 1
-            controller.start_lobby(target.package)
-            time.sleep(1.5)
-        else:
-            logger.error("[%s] Inject lỗi: %s", target.package, detail)
+            time.sleep(2.0)
     logger.info("Đã hoàn tất đăng nhập cho %d/%d package", succeeded, len(config.targets))
     return 0
 
@@ -1444,7 +1524,7 @@ def interactive_menu(
         print(f"│ {Colors.MAGENTA}   2{Colors.RESET}  │ {Colors.CYAN}Nhập Game ID / Link Server VIP                         {Colors.RESET}│")
         print(f"│ {Colors.MAGENTA}   3{Colors.RESET}  │ {Colors.CYAN}Chọn Package Roblox để chạy                            {Colors.RESET}│")
         print(f"│ {Colors.MAGENTA}   4{Colors.RESET}  │ {Colors.CYAN}Mở tất cả App lên nền (Warm-up)                        {Colors.RESET}│")
-        print(f"│ {Colors.MAGENTA}   5{Colors.RESET}  │ {Colors.CYAN}Login Cookie tự động qua Root (Deep Inject)            {Colors.RESET}│")
+        print(f"│ {Colors.MAGENTA}   5{Colors.RESET}  │ {Colors.CYAN}Login Cookie qua Root (Auth Ticket Engine)             {Colors.RESET}│")
         print(f"│ {Colors.MAGENTA}  13{Colors.RESET}  │ {Colors.GREEN}Cấu hình Nâng cao (Grid / Heartbeat Watchdog)          {Colors.RESET}│")
         print(f"│ {Colors.MAGENTA}   0{Colors.RESET}  │ {Colors.RED}Thoát Hệ Thống                                         {Colors.RESET}│")
         print("└──────┴────────────────────────────────────────────────────────┘")
