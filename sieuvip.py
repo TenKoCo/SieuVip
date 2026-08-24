@@ -3,6 +3,7 @@
 
 Implements HTTPS Cookie verification, CSRF retrieval, Auth Ticket generation,
 and Intent Deep-Link launching for unattended 24/7 sessions.
+Supports raw cookies, tk:mk:cookie, and .ROBLOSECURITY formats.
 """
 
 from __future__ import annotations
@@ -600,6 +601,20 @@ class RobloxHTTPSAuth:
     @staticmethod
     def normalize_cookie(raw_cookie: str) -> str:
         value = str(raw_cookie).strip().strip("'\"")
+
+        # Tự động nhận diện và bóc tách định dạng tk:mk:cookie hoặc user:pass:token:...
+        if ":" in value and not value.startswith("_|WARNING:") and not value.lower().startswith(".roblosecurity="):
+            parts = value.split(":")
+            # Tìm phần tử có tiền tố cookie hoặc độ dài hợp lệ (>= 50 ký tự)
+            for part in parts:
+                p_clean = part.strip()
+                if p_clean.startswith("_|WARNING:") or len(p_clean) >= 50:
+                    value = p_clean
+                    break
+            else:
+                if len(parts) >= 3 and len(parts[2].strip()) >= 50:
+                    value = parts[2].strip()
+
         value = re.sub(r"\\([_.|\-])", r"\1", value)
         header_match = re.search(r"(?i)(?:^|[;\s])\.ROBLOSECURITY\s*=\s*([^;\s]+)", value)
         if header_match:
@@ -723,7 +738,6 @@ class CookieStore:
                 continue
 
         if not mapping and lines:
-            # Nếu chỉ có 1 cookie duy nhất trong file -> áp dụng chung cho tất cả package
             single_cookie = lines[0]
             try:
                 norm = RobloxHTTPSAuth.normalize_cookie(single_cookie)
@@ -1177,7 +1191,6 @@ class RejoinEngine:
         self.controller.force_stop(target.package)
         self._sleep(0.5)
 
-        # Lấy Auth Ticket từ Cookie qua HTTPS API
         ticket = None
         cookie = self.cookies.get(target.package)
         if self.config.auto_login_cookies and cookie:
