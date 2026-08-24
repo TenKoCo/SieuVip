@@ -16,7 +16,7 @@ _svr_setup_main() {
     local cookie_store
 
     engine_url="${SIEUVIP_REJOIN_URL:-https://raw.githubusercontent.com/TenKoCo/SieuVip/refs/heads/main/sieuvip.py}"
-    expected_sha256="${SIEUVIP_REJOIN_SHA256:-406cb0c60fb453bf7d42b6584b3e0f4ffe718f3ea56b7ba85a8326e68e036529}"
+    expected_sha256="${SIEUVIP_REJOIN_SHA256:-615b5cd56df03056b7784099c00ce9ca54054df6d914650129a26e0bcc612a1c}"
     cache_dir="${XDG_DATA_HOME:-${HOME}/.local/share}/sieuvip-rejoin"
     engine_file="${cache_dir}/sieuvip.py"
     temporary_file="${engine_file}.download.$$"
