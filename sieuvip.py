@@ -1,8 +1,8 @@
 #!/data/data/com.termux/files/usr/bin/python
 """SieuVip Roblox rejoin engine designed for Termux on Android.
 
-Implements cURL-based HTTPS Auth Ticket handshake and Multi-Package Deep Linking.
-Supports formats: tk:mk:cookie, raw cookie, and .ROBLOSECURITY header.
+Implements cURL-based HTTPS Auth Ticket handshake, Multi-Package Deep Linking,
+and Root-level Cookie Extractor from active Roblox sessions.
 """
 
 from __future__ import annotations
@@ -36,6 +36,7 @@ except ImportError:
 APP_NAME = "sieuvip-rejoin"
 DEFAULT_CONFIG_PATH = Path("/sdcard/Download/sieuvip_config.json")
 DEFAULT_COOKIE_PATH = Path("/sdcard/Download/cookie.txt")
+DEFAULT_EXPORT_COOKIE_PATH = Path("/sdcard/Download/exported_cookies.txt")
 DEFAULT_LOG_PATH = Path("/sdcard/Download/sieuvip_rejoin.log")
 DEFAULT_LOCK_PATH = Path("/sdcard/Download/sieuvip_rejoin.lock")
 DEFAULT_BLOX_FRUITS_PLACE_ID = "2753915549"
@@ -593,15 +594,12 @@ def _select_adb_device(adb_path: str, requested_serial: Optional[str]) -> Option
 
 
 class RobloxHTTPSAuth:
-    """Uses curl via system to bypass Cloudflare TLS fingerprint blocks."""
-
     USER_AGENT = "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
 
     @staticmethod
     def normalize_cookie(raw_cookie: str) -> str:
         value = str(raw_cookie).strip().strip("'\"")
 
-        # Bóc tách tk:mk:cookie
         if ":" in value and not value.startswith("_|WARNING:") and not value.lower().startswith(".roblosecurity="):
             parts = value.split(":")
             for part in parts:
@@ -658,7 +656,6 @@ class RobloxHTTPSAuth:
         except Exception as e:
             return None, str(e)
 
-        # 1. Lấy CSRF Token
         cmd_csrf = [
             "curl", "-s", "-i", "-m", "10",
             "-X", "POST", "https://auth.roblox.com/v1/authentication-ticket/",
@@ -674,7 +671,6 @@ class RobloxHTTPSAuth:
             return None, "Không lấy được CSRF Token từ máy chủ"
         csrf_token = csrf_match.group(1).strip()
 
-        # 2. Sinh Vé Auth Ticket
         cmd_ticket = [
             "curl", "-s", "-i", "-m", "10",
             "-X", "POST", "https://auth.roblox.com/v1/authentication-ticket/",
@@ -693,6 +689,50 @@ class RobloxHTTPSAuth:
             return ticket_match.group(1).strip(), "OK"
 
         return None, "Roblox không cấp Auth Ticket (Có thể cần xác minh trình duyệt)"
+
+
+class CookieExtractor:
+    """Extracts .ROBLOSECURITY from active Android Roblox app data."""
+
+    @classmethod
+    def extract_from_package(cls, backend: AndroidBackend, package: str) -> Tuple[Optional[str], str]:
+        script = f"""
+pkg="{package}"
+app_dir="/data/data/$pkg"
+if [ ! -d "$app_dir" ] && [ -d "/data/user/0/$pkg" ]; then
+    app_dir="/data/user/0/$pkg"
+fi
+
+# 1. Quét tìm chuỗi cookie trong toàn bộ dữ liệu SQLite và XML của app
+grep -aohE '_\|WARNING:-DO-NOT-SHARE-THIS\.[^"\'<>[:space:]]+' "$app_dir" 2>/dev/null | head -n 1
+"""
+        res = backend.run(["sh", "-c", script], timeout=15)
+        raw_found = res.stdout.strip()
+
+        if raw_found and len(raw_found) >= 50:
+            try:
+                norm = RobloxHTTPSAuth.normalize_cookie(raw_found)
+                return norm, "Trích xuất thành công từ bộ nhớ App"
+            except Exception:
+                pass
+
+        # Fallback quét từ file XML shared_prefs nếu grep trực tiếp chưa ra
+        script_fallback = f"""
+pkg="{package}"
+app_dir="/data/data/$pkg"
+[ ! -d "$app_dir" ] && app_dir="/data/user/0/$pkg"
+grep -a 'RBXSession' "$app_dir/shared_prefs/"*.xml 2>/dev/null | sed -n 's/.*<string name="RBXSession">\\(.*\\)<\\/string>.*/\\1/p' | head -n 1
+"""
+        res_fb = backend.run(["sh", "-c", script_fallback], timeout=10)
+        fb_found = res_fb.stdout.strip()
+        if fb_found and len(fb_found) >= 50:
+            try:
+                norm = RobloxHTTPSAuth.normalize_cookie(fb_found)
+                return norm, "Trích xuất thành công từ Shared Preferences"
+            except Exception:
+                pass
+
+        return None, "Không tìm thấy session Cookie nào đang hoạt động trong app này"
 
 
 class CookieStore:
@@ -894,7 +934,6 @@ class AndroidController:
         return self.command_accepted(result), result.output
 
     def apply_shared_prefs_cookie(self, package: str, cookie: str) -> None:
-        """Inject fallback preferences into app shared_prefs directory."""
         c = cookie
         if not c.startswith("_|WARNING:-DO-NOT-SHARE-THIS"):
             c = "_|WARNING:-DO-NOT-SHARE-THIS.--Sharing-this-will-allow-someone-to-log-into-your-account-and-rob-your-robox.--|_" + c
@@ -1422,6 +1461,38 @@ def _check_and_launch_cookies(
     return 0
 
 
+def _export_cookies_menu(
+    config: RejoinConfig,
+    backend: AndroidBackend,
+    logger: logging.Logger,
+) -> None:
+    if not config.targets:
+        raise ConfigError("Chưa chọn package. Vui lòng vào mục 3 trước.")
+
+    print(f"\n{Colors.CYAN}[*] Đang quét session Cookie từ các app đã chọn...{Colors.RESET}\n")
+    results = []
+
+    for target in config.targets:
+        cookie, msg = CookieExtractor.extract_from_package(backend, target.package)
+        if cookie:
+            valid, user, uid, val_msg = RobloxHTTPSAuth.validate_cookie(cookie)
+            info = f"Acc: {user} (ID: {uid})" if valid else "Session offline/chưa rõ"
+            print(f"[{Colors.GREEN}✓{Colors.RESET}] {target.package} -> {info}")
+            print(f"    Cookie: {cookie[:40]}...{cookie[-15:]}\n")
+            results.append(f"{target.package} | {info}\n{cookie}\n")
+        else:
+            print(f"[{Colors.RED}✗{Colors.RESET}] {target.package} -> {msg}")
+
+    if results:
+        DEFAULT_EXPORT_COOKIE_PATH.write_text("\n".join(results), encoding="utf-8")
+        print(f"{Colors.GREEN}======================================================{Colors.RESET}")
+        print(f"Đã lưu toàn bộ Cookie hợp lệ vào:")
+        print(f"{Colors.BOLD}{DEFAULT_EXPORT_COOKIE_PATH}{Colors.RESET}")
+        print(f"{Colors.GREEN}======================================================{Colors.RESET}")
+    else:
+        print(f"\n{Colors.YELLOW}Không trích xuất được cookie nào từ các package trên.{Colors.RESET}")
+
+
 def _config_menu(config: RejoinConfig, config_path: Path) -> None:
     while True:
         print("\033[2J\033[H", end="")
@@ -1469,6 +1540,7 @@ def interactive_menu(
         print(f"│ {Colors.MAGENTA}   3{Colors.RESET}  │ {Colors.CYAN}Chọn Package Roblox để chạy                            {Colors.RESET}│")
         print(f"│ {Colors.MAGENTA}   4{Colors.RESET}  │ {Colors.CYAN}Mở tất cả App lên nền (Warm-up)                        {Colors.RESET}│")
         print(f"│ {Colors.MAGENTA}   5{Colors.RESET}  │ {Colors.CYAN}Xác thực Cookie cURL & Mở Game qua Vé Auth Ticket      {Colors.RESET}│")
+        print(f"│ {Colors.MAGENTA}   6{Colors.RESET}  │ {Colors.GREEN}Xuất Cookie từ các App Roblox đang đăng nhập trên máy  {Colors.RESET}│")
         print(f"│ {Colors.MAGENTA}  13{Colors.RESET}  │ {Colors.GREEN}Cấu hình Nâng cao (Grid / Heartbeat Watchdog)          {Colors.RESET}│")
         print(f"│ {Colors.MAGENTA}   0{Colors.RESET}  │ {Colors.RED}Thoát Hệ Thống                                         {Colors.RESET}│")
         print("└──────┴────────────────────────────────────────────────────────┘")
@@ -1497,6 +1569,8 @@ def interactive_menu(
                     controller.start_lobby(t.package)
             elif choice == "5":
                 _check_and_launch_cookies(config, controller, cookie_source, logger)
+            elif choice == "6":
+                _export_cookies_menu(config, backend, logger)
             elif choice == "13":
                 _config_menu(config, config_path)
         except Exception as exc:
