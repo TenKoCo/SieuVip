@@ -167,7 +167,6 @@ class RejoinConfig:
             raw.get("health_check_method", "online")
         ).strip().lower()
         
-        # Tự động chuyển đổi config cũ
         if health_check_method in {"intent", "heartbeat"}:
             health_check_method = "heartbeat_local" if health_check_method == "heartbeat" else "online"
         if health_check_method not in {"online", "heartbeat_local"}:
@@ -865,7 +864,6 @@ class CookieInstaller:
         if not c.startswith("_|WARNING:-DO-NOT-SHARE-THIS"):
             c = "_|WARNING:-DO-NOT-SHARE-THIS.--Sharing-this-will-allow-someone-to-log-into-your-account-and-rob-your-robox.--|_" + c
 
-        # Sử dụng lệnh `sed` đã được chứng minh hiệu quả trên HĐH Android.
         xml_path = f"/data/data/{package}/shared_prefs/com.roblox.client_preferences.xml"
         cmd = (
             f"mkdir -p /data/data/{package}/shared_prefs && "
@@ -1119,7 +1117,7 @@ class RejoinEngine:
         self.cookie_installer = cookie_installer
         self.cookies = cookies or {}
         self.stop_requested = False
-        self._ping_paths: Dict[str, str] = {} # Bộ nhớ đệm lưu đường dẫn file *.main
+        self._ping_paths: Dict[str, str] = {}
 
     def request_stop(self, signum: int, frame: Any) -> None:
         del frame
@@ -1128,7 +1126,6 @@ class RejoinEngine:
         self.stop_requested = True
 
     def _inject_ping_script(self) -> None:
-        """Sinh ra file .main ngẫu nhiên và tiêm ngầm vào thư mục Executor"""
         check_filename = f"{random.randint(100000, 999999)}.main"
         lua_code = f"""spawn(function()
     while task.wait(30) do
@@ -1158,19 +1155,15 @@ end)"""
             check_cmd = f"[ -d {target} ] && echo EXISTS"
             res = self.controller.backend.run(["sh", "-c", check_cmd], timeout=5)
             if "EXISTS" in res.output:
-                # Xóa sạch các script Lua cũ của Tool để tránh rác
                 self.controller.backend.run(["sh", "-c", f"rm -f {target}/SieuVip_Ping_*.lua"], timeout=5)
-                # Copy file Lua ngẫu nhiên mới vào đích
                 dest_file = f"{target}/SieuVip_Ping_{random.randint(10,99)}.lua"
                 copy_cmd = f"cp {temp_file} {dest_file} && chmod 777 {dest_file}"
                 self.controller.backend.run(["sh", "-c", copy_cmd], timeout=5)
                 
-        # Dọn dẹp file tạm
         self.controller.backend.run(["sh", "-c", f"rm -f {temp_file}"], timeout=5)
         self.logger.info("Đã tiêm script giám sát heartbeat (.main) ngẫu nhiên vào các Executor")
 
     def _get_local_heartbeat(self, target: TargetConfig) -> Tuple[Optional[float], str]:
-        """Đọc thời gian từ file *.main được script Lua tuồn ra"""
         ping_path = self._ping_paths.get(target.package)
         if not ping_path:
             find_cmd = f"find /sdcard/Android/data/{target.package} -name '*.main' -type f 2>/dev/null | head -n 1"
@@ -1456,7 +1449,6 @@ end)"""
             return False, "Timestamp heartbeat nằm quá xa trong tương lai"
         age = max(0.0, now - timestamp)
         if age > self.config.health_check_timeout_seconds:
-            # Xóa cache file cũ nếu bị out-of-date để không nhận diện sai sau khi force-stop
             old_path = self._ping_paths.get(target.package)
             if old_path:
                 self.controller.backend.run(["sh", "-c", f"rm -f {shlex.quote(old_path)}"])
@@ -2194,6 +2186,14 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    # --- BẮT ĐẦU ĐOẠN SỬA ĐỂ TƯƠNG THÍCH VỚI LỆNH TOIDAY ---
+    # Tự động gán lệnh "menu" nếu file toiday chỉ gọi "python sieuvip.py" trống
+    if argv is None:
+        argv = sys.argv[1:]
+    if not argv:
+        argv = ["menu"]
+    # --- KẾT THÚC ĐOẠN SỬA ---
+    
     args = build_parser().parse_args(argv)
     log_path = DEFAULT_LOG_PATH
     logger = setup_logger(log_path, verbose=args.verbose)
