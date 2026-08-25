@@ -1,4 +1,3 @@
-cat << 'EOF' > /sdcard/Download/sieuvip.py
 #!/data/data/com.termux/files/usr/bin/python
 """
 SieuVip Roblox Rejoin Engine & Cookie Auth System for Android Root.
