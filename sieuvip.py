@@ -423,5 +423,3 @@ def interactive_dashboard():
 
 if __name__ == "__main__":
     interactive_dashboard()
-EOF
-chmod +x /sdcard/Download/sieuvip.py
