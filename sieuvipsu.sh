@@ -25,4 +25,4 @@ pkg install python-psutil -y
 # 6. Tải tool SieuVip về thư mục Download
 curl -Ls "https://raw.githubusercontent.com/TenKoCo/SieuVip/refs/heads/main/sieuvip.py" -o /sdcard/Download/sieuvip.py
 
-echo "[+] Cài đặt hoàn tất! Chạy tool: python /sdcard/Download/sieuvip.py" đây là file để tải tool trong termux, có thể tối ưu k 
+echo "[+] Cài đặt hoàn tất! "
