@@ -22,6 +22,7 @@ import re
 import shlex
 import shutil
 import signal
+import sqlite3
 import ssl
 import subprocess
 import sys
@@ -623,18 +624,15 @@ class RobloxAuthSystem:
         """Tách chuỗi cookie từ các dòng user:pass:cookie hoặc user|pass|cookie."""
         s = str(line).strip().strip("'\"")
         
-        # Nếu có tiền tố .ROBLOSECURITY=
         match = re.search(r"(?i)\.ROBLOSECURITY\s*=\s*([^;\s]+)", s)
         if match:
             return match.group(1).strip()
 
-        # Nếu có dấu hiệu WARNING của Roblox
         if "_|WARNING:" in s:
             match = re.search(r"(_\|WARNING:[^;\r\n]+)", s)
             if match:
                 return match.group(1).strip()
 
-        # Dạng user:pass:token
         if ":" in s and not s.startswith("http"):
             parts = s.split(":")
             for p in reversed(parts):
@@ -656,16 +654,12 @@ class RobloxAuthSystem:
         if len(extracted) < 50:
             return False, None, None, "Định dạng cookie không hợp lệ hoặc quá ngắn"
 
-        # Roblox chấp nhận định dạng nguyên bản (có hoặc không có WARNING)
-        # Thử với token đã trích xuất
         candidate_tokens = [extracted]
         if "_|WARNING:" in extracted:
-            # Token rút gọn sau |_
             parts = extracted.split("|_")
             if len(parts) > 1:
                 candidate_tokens.append(parts[-1].strip())
         else:
-            # Thử thêm header chuẩn WARNING
             candidate_tokens.append(
                 f"_|WARNING:-DO-NOT-SHARE-THIS.--Sharing-this-will-allow-someone-to-log-into-your-account-and-rob-your-robox.--|_{extracted}"
             )
@@ -690,7 +684,7 @@ class RobloxAuthSystem:
                     username = data.get("name")
             except urllib.error.HTTPError as err:
                 if err.code == 401:
-                    last_error = "Cookie bị từ chối (HTTP 401: Có thể do Cookie bị khóa IP từ PC hoặc đã bị đổi mật khẩu/hết hạn)"
+                    last_error = "Cookie bị từ chối (HTTP 401: Khóa IP hoặc hết hạn)"
                 elif err.code == 429:
                     last_error = "Roblox đang tạm chặn Rate Limit (HTTP 429). Hãy đợi 1-2 phút"
                 elif err.code == 403:
@@ -775,21 +769,82 @@ def load_cookie_list(path: Path) -> List[str]:
         return []
 
 
-def inject_shared_prefs(backend: AndroidBackend, package: str, raw_cookie: str) -> None:
-    """Ghi đè session cookie vào SharedPreferences khi có quyền root."""
+def inject_direct_root_cookies(backend: AndroidBackend, package: str, raw_cookie: str) -> None:
+    """Tiêm trực tiếp Cookie vào SQLite WebView & SharedPreferences khi có quyền Root."""
     if not backend.can_write_app_data:
         return
+
     token = RobloxAuthSystem.extract_raw_cookie(raw_cookie)
     full_session = (
         token if "_|WARNING:" in token else
         f"_|WARNING:-DO-NOT-SHARE-THIS.--Sharing-this-will-allow-someone-to-log-into-your-account-and-rob-your-robox.--|_{token}"
     )
+
+    # 1. Tạo SQLite Cookies DB
+    temp_db = "/sdcard/Download/tmp_cookies.db"
+    try:
+        if os.path.exists(temp_db):
+            os.remove(temp_db)
+        conn = sqlite3.connect(temp_db)
+        cur = conn.cursor()
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS cookies (
+            creation_utc INTEGER NOT NULL,
+            host_key TEXT NOT NULL,
+            top_frame_site_key TEXT NOT NULL,
+            name TEXT NOT NULL,
+            value TEXT NOT NULL,
+            encrypted_value BLOB NOT NULL,
+            path TEXT NOT NULL,
+            expires_utc INTEGER NOT NULL,
+            is_secure INTEGER NOT NULL,
+            is_httponly INTEGER NOT NULL,
+            last_access_utc INTEGER NOT NULL,
+            has_expires INTEGER NOT NULL,
+            is_persistent INTEGER NOT NULL,
+            priority INTEGER NOT NULL,
+            samesite INTEGER NOT NULL,
+            source_scheme INTEGER NOT NULL,
+            source_port INTEGER NOT NULL,
+            is_same_party INTEGER NOT NULL,
+            last_update_utc INTEGER NOT NULL
+        );
+        """)
+        now_micro = int((time.time() + 11644473600) * 1000000)
+        expire_micro = int((time.time() + 11644473600 + 315360000) * 1000000)
+        cur.execute("""
+        INSERT INTO cookies (
+            creation_utc, host_key, top_frame_site_key, name, value, encrypted_value, path,
+            expires_utc, is_secure, is_httponly, last_access_utc, has_expires, is_persistent,
+            priority, samesite, source_scheme, source_port, is_same_party, last_update_utc
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            now_micro, ".roblox.com", "", ".ROBLOSECURITY", full_session, b"", "/",
+            expire_micro, 1, 1, now_micro, 1, 1, 1, 0, 2, 443, 0, now_micro
+        ))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
+    # 2. Tiêm vào /data/data/$pkg
     script = f"""
 pkg="{package}"
 app_dir="/data/data/$pkg"
 [ ! -d "$app_dir" ] && app_dir="/data/user/0/$pkg"
 if [ -d "$app_dir" ]; then
     owner=$(stat -c '%u:%g' "$app_dir" 2>/dev/null || echo "10000:10000")
+    
+    # Tiêm SQLite WebView Cookies
+    if [ -f "{temp_db}" ]; then
+        for wdir in "$app_dir/app_webview" "$app_dir/app_webview/Default"; do
+            mkdir -p "$wdir"
+            cp "{temp_db}" "$wdir/Cookies" 2>/dev/null
+            chmod 660 "$wdir/Cookies" 2>/dev/null
+        done
+    fi
+
+    # Tiêm XML SharedPreferences
     mkdir -p "$app_dir/shared_prefs"
     for xml in "com.roblox.client_preferences.xml" "${{pkg}}_preferences.xml"; do
         cat << 'EOF_XML' > "$app_dir/shared_prefs/$xml"
@@ -802,11 +857,14 @@ if [ -d "$app_dir" ]; then
 EOF_XML
         chmod 660 "$app_dir/shared_prefs/$xml"
     done
-    chown -R "$owner" "$app_dir/shared_prefs"
-    chmod 771 "$app_dir/shared_prefs"
+
+    chown -R "$owner" "$app_dir" 2>/dev/null
+    chmod 771 "$app_dir/app_webview" 2>/dev/null
+    chmod 771 "$app_dir/shared_prefs" 2>/dev/null
 fi
+rm -f "{temp_db}"
 """
-    backend.run(["sh", "-c", script], timeout=10)
+    backend.run(["sh", "-c", script], timeout=12)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -911,7 +969,11 @@ def _is_roblox_url(value: str) -> bool:
 
 
 class AndroidController:
-    PROTOCOL_ACTIVITY = "com.roblox.client.ActivityProtocolLaunch"
+    KNOWN_ACTIVITIES = (
+        "com.roblox.client.ActivityProtocolLaunch",
+        "com.roblox.client.RobloxActivity",
+        "com.roblox.client.startup.StartupActivity",
+    )
     FAILURE_MARKERS = (
         "error:",
         "exception",
@@ -1009,40 +1071,46 @@ class AndroidController:
         option_variants.append([])
 
         errors: List[str] = []
-        component = f"{package}/{self.PROTOCOL_ACTIVITY}"
-        for url in spec.candidate_urls(ticket=ticket):
+        urls = spec.candidate_urls(ticket=ticket)
+
+        for url in urls:
             for options in option_variants:
-                intents = (
-                    [
-                        "am",
-                        "start",
-                        "-W",
-                        *options,
-                        "-a",
-                        "android.intent.action.VIEW",
-                        "-d",
-                        url,
-                        "-n",
-                        component,
-                    ],
-                    [
-                        "am",
-                        "start",
-                        "-W",
-                        *options,
-                        "-a",
-                        "android.intent.action.VIEW",
-                        "-d",
-                        url,
-                        "-p",
-                        package,
-                    ],
-                )
+                intents: List[List[str]] = []
+                
+                # 1. Thử từng Activity cụ thể của Roblox/Clone
+                for act in self.KNOWN_ACTIVITIES:
+                    intents.append([
+                        "am", "start", "-W", *options,
+                        "-a", "android.intent.action.VIEW",
+                        "-d", url,
+                        "-n", f"{package}/{act}",
+                    ])
+                
+                # 2. Thử intent kèm cờ Package
+                intents.append([
+                    "am", "start", "-W", *options,
+                    "-a", "android.intent.action.VIEW",
+                    "-d", url,
+                    "-p", package,
+                ])
+
+                # 3. Thử truyền tham số extras trực tiếp (--es ticket ...)
+                if ticket and spec.place_id:
+                    intents.append([
+                        "am", "start", "-W", *options,
+                        "-a", "android.intent.action.VIEW",
+                        "-d", url,
+                        "-p", package,
+                        "--es", "ticket", ticket,
+                        "--es", "placeId", spec.place_id,
+                    ])
+
                 for argv in intents:
                     result = self.backend.run(argv, timeout=self.command_timeout)
                     if self.command_accepted(result):
                         return True, result.output or "Android đã nhận intent"
                     errors.append(result.output or f"rc={result.returncode}")
+
         return False, " | ".join(_compact(item, 180) for item in errors[-3:])
 
     def list_packages(self) -> Tuple[List[str], str]:
@@ -1474,13 +1542,17 @@ def _menu_login_cookie(
 
         print(f"{Colors.GREEN}[+] Tài khoản: {user} | Lấy Auth Ticket thành công!{Colors.RESET}")
 
+        # 1. Tiêm trực tiếp Cookie vào SQLite WebView & SharedPreferences nếu có quyền Root
         if controller.backend.can_write_app_data:
-            inject_shared_prefs(controller.backend, target.package, raw_cookie)
+            print(f"{Colors.CYAN}[*] Đang tiêm Cookie trực tiếp vào SQLite WebView app...{Colors.RESET}")
+            inject_direct_root_cookies(controller.backend, target.package, raw_cookie)
 
+        # 2. Force Stop để app nạp session mới
         if controller.backend.can_force_stop:
             controller.force_stop(target.package)
-            time.sleep(0.5)
+            time.sleep(0.6)
 
+        # 3. Khởi chạy Deep link đa Activity
         spec = RobloxLaunchSpec.parse(target.link)
         launched, detail = controller.start_deep_link(
             target.package,
@@ -1491,7 +1563,7 @@ def _menu_login_cookie(
         )
 
         if launched:
-            print(f"{Colors.GREEN}[+] Đã khởi chạy game thành công cho {target.package}!{Colors.RESET}")
+            print(f"{Colors.GREEN}[+] Đã tiêm Cookie & khởi chạy game thành công cho {target.package}!{Colors.RESET}")
         else:
             print(f"{Colors.RED}[-] Lỗi khởi chạy Intent: {_compact(detail)}{Colors.RESET}")
         time.sleep(1.5)
