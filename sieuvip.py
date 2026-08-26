@@ -1516,6 +1516,7 @@ def _menu_login_cookie(
     controller: AndroidController,
     logger: logging.Logger,
 ) -> None:
+    """Mục 5: Đăng nhập Cookie vào từng app và hoàn tất ngay lập tức."""
     if not config.targets:
         print(f"\n{Colors.YELLOW}[!] Chưa chọn package nào. Vui lòng vào mục 3 trước.{Colors.RESET}")
         return
@@ -1542,17 +1543,17 @@ def _menu_login_cookie(
 
         print(f"{Colors.GREEN}[+] Tài khoản: {user} | Lấy Auth Ticket thành công!{Colors.RESET}")
 
-        # 1. Tiêm trực tiếp Cookie vào SQLite WebView & SharedPreferences nếu có quyền Root
+        # 1. Tiêm SQLite WebView Cookies & SharedPreferences
         if controller.backend.can_write_app_data:
-            print(f"{Colors.CYAN}[*] Đang tiêm Cookie trực tiếp vào SQLite WebView app...{Colors.RESET}")
+            print(f"{Colors.CYAN}[*] Đang nạp Cookie vào SQLite WebView...{Colors.RESET}")
             inject_direct_root_cookies(controller.backend, target.package, raw_cookie)
 
-        # 2. Force Stop để app nạp session mới
+        # 2. Force Stop để app áp dụng dữ liệu phiên mới
         if controller.backend.can_force_stop:
             controller.force_stop(target.package)
             time.sleep(0.6)
 
-        # 3. Khởi chạy Deep link đa Activity
+        # 3. Khởi chạy app vào game / sảnh
         spec = RobloxLaunchSpec.parse(target.link)
         launched, detail = controller.start_deep_link(
             target.package,
@@ -1563,10 +1564,12 @@ def _menu_login_cookie(
         )
 
         if launched:
-            print(f"{Colors.GREEN}[+] Đã tiêm Cookie & khởi chạy game thành công cho {target.package}!{Colors.RESET}")
+            print(f"{Colors.GREEN}[+] Đã đăng nhập & mở app {target.package} thành công!{Colors.RESET}")
         else:
             print(f"{Colors.RED}[-] Lỗi khởi chạy Intent: {_compact(detail)}{Colors.RESET}")
         time.sleep(1.5)
+
+    print(f"\n{Colors.GREEN}{Colors.BOLD}[✓] Hoàn tất quá trình đăng nhập Cookie!{Colors.RESET}")
 
 
 def _config_menu(config: RejoinConfig, config_path: Path) -> None:
