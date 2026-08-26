@@ -1,7 +1,10 @@
 #!/data/data/com.termux/files/usr/bin/python
 """
 SieuVip Roblox Engine - Root Cookie Auth & Realtime Auto Rejoin System for Android.
-Quy trình chuẩn: Khởi động dọn dẹp app -> Đóng sạch sẽ -> Rejoin từng app vào game kèm chia lưới (Grid Freeform).
+Quy trình chuẩn:
+1. Đóng sạch các app đang chạy ngầm.
+2. Mở lần lượt từng app lên sảnh rồi đóng lại (Warmup sạch, không sort, không join game).
+3. Rejoin lần lượt từng app vào game kèm chia lưới ô cửa sổ nổi (Grid Freeform) và kích hoạt Watchdog 24/7.
 """
 
 from __future__ import annotations
@@ -44,6 +47,12 @@ DEFAULT_BLOX_FRUITS_PLACE_ID = "2753915549"
 PACKAGE_RE = re.compile(r"^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+$")
 USER_AGENT = "Roblox/Android (Android 10; Mobile; Build/10.0)"
 
+SYSTEM_PATH = (
+    "/product/bin:/apex/com.android.runtime/bin:/apex/com.android.art/bin:"
+    "/system_ext/bin:/system/bin:/system/xbin:/odm/bin:/vendor/bin:/vendor/xbin:"
+    "/data/data/com.termux/files/usr/bin"
+)
+
 SSL_CONTEXT = ssl.create_default_context()
 SSL_CONTEXT.check_hostname = False
 SSL_CONTEXT.verify_mode = ssl.CERT_NONE
@@ -66,10 +75,6 @@ class AppError(RuntimeError):
 
 
 class ConfigError(AppError):
-    pass
-
-
-class BackendError(AppError):
     pass
 
 
@@ -378,18 +383,40 @@ class RobloxAuthSystem:
 
 
 class RootController:
-    """Thực thi các lệnh can thiệp hệ thống qua quyền Root (su). Tối ưu chạy cực nhanh."""
+    """Thực thi các lệnh Android sạch sẽ, loại bỏ hoàn toàn biến môi trường Termux gây lỗi."""
 
     @staticmethod
-    def run(cmd: str, timeout: float = 10.0) -> Tuple[bool, str]:
+    def _clean_env() -> Dict[str, str]:
+        env = os.environ.copy()
+        env.pop("LD_PRELOAD", None)
+        env.pop("LD_LIBRARY_PATH", None)
+        env["PATH"] = SYSTEM_PATH
+        return env
+
+    @classmethod
+    def run(cls, cmd: str, timeout: float = 10.0) -> Tuple[bool, str]:
+        env = cls._clean_env()
         try:
-            res = subprocess.run(
-                ["su", "-c", cmd],
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                check=False
-            )
+            if os.geteuid() == 0:
+                res = subprocess.run(
+                    ["sh", "-c", cmd],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    env=env,
+                    check=False
+                )
+            else:
+                su_bin = shutil.which("su") or "/system/bin/su" or "/system/xbin/su" or "/sbin/su"
+                remote = f"PATH={SYSTEM_PATH} LD_PRELOAD= LD_LIBRARY_PATH= exec {cmd}"
+                res = subprocess.run(
+                    [su_bin, "-c", remote],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    env=env,
+                    check=False
+                )
             out = (res.stdout + "\n" + res.stderr).strip()
             return res.returncode == 0, out
         except Exception as e:
@@ -571,7 +598,7 @@ def mask_username(username: Optional[str]) -> str:
 
 
 class RealtimeDashboardEngine:
-    """Engine giám sát thời gian thực: Khởi động dọn dẹp -> Rejoin vào game kèm chia lưới."""
+    """Engine giám sát thời gian thực: Tắt sạch nền -> Warmup sạch -> Rejoin vào game kèm chia lưới."""
 
     def __init__(self, config: RejoinConfig, logger: logging.Logger) -> None:
         self.config = config
@@ -726,21 +753,34 @@ done
         print(f"{Colors.GRAY}Nhấn Ctrl+C để dừng và quay lại Menu.{Colors.RESET}")
         sys.stdout.flush()
 
-    def _warmup_and_reset_apps(self, enabled: List[TargetConfig]) -> None:
-        """Giai đoạn 1: Mở lần lượt từng app (không join game, không sort) rồi đóng lại sạch sẽ."""
+    def _startup_sequence(self, enabled: List[TargetConfig]) -> None:
+        """Quy trình khởi tạo:
+        1. Đóng sạch app chạy ngầm.
+        2. Mở lần lượt từng app lên rồi đóng lại (Warmup sạch).
+        """
+        # BƯỚC 0: ĐÓNG SẠCH TẤT CẢ APP NẾU ĐANG MỞ NGẦM
+        for target in enabled:
+            if self.stop_requested:
+                break
+            pkg = target.package
+            self.package_status[pkg] = "Closing..."
+            RootController.force_stop(pkg)
+            time.sleep(0.3)
+
+        # BƯỚC 1: MỞ LẦN LƯỢT TỪNG APP (KHÔNG JOIN GAME, KHÔNG SORT) RỒI ĐÓNG LẠI
         for target in enabled:
             if self.stop_requested:
                 break
             pkg = target.package
             self.package_status[pkg] = "Warmup..."
-            # Mở app thuần túy lên sảnh, không chia cửa sổ
+            # Mở app thuần túy lên sảnh (không bounds, không sort)
             RootController.launch_lobby_only(pkg, freeform=False, bounds=None)
-            time.sleep(2.0)
+            time.sleep(2.5)
             
-            # Đóng app ngay lập tức
+            # Đóng app
             self.package_status[pkg] = "Closing..."
             RootController.force_stop(pkg)
-            time.sleep(0.6)
+            time.sleep(0.8)
             self.package_status[pkg] = "Waiting..."
 
     def _worker_loop(self) -> None:
@@ -748,8 +788,8 @@ done
         cookies = load_cookie_list(DEFAULT_COOKIE_SOURCE_PATH)
         total_enabled = len(enabled)
 
-        # GIAI ĐOẠN 1: MỞ LẦN LƯỢT TỪNG APP RỒI ĐÓNG LẠI SẠCH SẼ (KHÔNG JOIN GAME, KHÔNG SORT)
-        self._warmup_and_reset_apps(enabled)
+        # THỰC THI QUY TRÌNH DỌN DẸP & WARMUP BAN ĐẦU
+        self._startup_sequence(enabled)
 
         # GIAI ĐOẠN 2: REJOIN TỪNG APP VÀO GAME KÈM SORT / CHIA LƯỚI
         while not self.stop_requested:
