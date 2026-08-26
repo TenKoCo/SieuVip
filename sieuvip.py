@@ -493,6 +493,22 @@ fi
         cls.run(script)
 
     @classmethod
+    def apply_task_bounds(cls, package: str, bounds: str) -> None:
+        """Định hình kích thước và toạ độ cửa sổ nổi cho package."""
+        if not bounds:
+            return
+        parts = [p.strip() for p in bounds.split(",") if p.strip()]
+        if len(parts) != 4:
+            return
+        l, t, r, b = parts
+        ok, out = cls.run(f"dumpsys activity tasks | grep -B 2 '{package}' | grep 'Task{{' | head -n 1")
+        m = re.search(r"Task\{[a-f0-9]+ #(\d+)", out)
+        if m:
+            task_id = m.group(1)
+            cls.run(f"am task move-to-freeform {task_id} {l} {t} {r} {b}")
+            cls.run(f"am task resize {task_id} {l} {t} {r} {b}")
+
+    @classmethod
     def launch(
         cls,
         package: str,
@@ -521,26 +537,40 @@ fi
             params["ticket"] = ticket
 
         deep_link = f"roblox://experiences/start?{urllib.parse.urlencode(params)}"
+        deep_link_short = f"roblox://{urllib.parse.urlencode(params)}"
 
-        opt = ""
+        opt_variants = []
         if freeform and bounds:
-            opt = f"--windowingMode 5 --bounds {bounds}"
-        elif freeform:
-            opt = "--windowingMode 5"
+            opt_variants.append(f"--windowingMode 5 --bounds {bounds}")
+        if freeform:
+            opt_variants.append("--windowingMode 5")
+        opt_variants.append("")
 
-        cmd = f"am start -W {opt} -a android.intent.action.VIEW -d '{deep_link}' -p {package}"
-        ok, out = cls.run(cmd)
-        if ok and "error" not in out.lower():
-            return True
+        intents_to_try = [
+            # 1. Deep link URL standard
+            lambda opt: f"am start {opt} -a android.intent.action.VIEW -d '{deep_link}' -p {package}",
+            # 2. Short Deep Link
+            lambda opt: f"am start {opt} -a android.intent.action.VIEW -d '{deep_link_short}' -p {package}",
+            # 3. Explicit launcher with intent
+            lambda opt: f"am start {opt} -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p {package}",
+        ]
 
-        cmd_fallback = f"am start -W {opt} -a android.intent.action.VIEW -d 'roblox://{urllib.parse.urlencode(params)}' -p {package}"
-        ok2, out2 = cls.run(cmd_fallback)
-        if ok2 and "error" not in out2.lower():
-            return True
+        for intent_fn in intents_to_try:
+            for opt in opt_variants:
+                cmd = intent_fn(opt).strip()
+                ok, out = cls.run(cmd)
+                if ok and "error" not in out.lower() and "unable to resolve" not in out.lower():
+                    if freeform and bounds:
+                        time.sleep(0.3)
+                        cls.apply_task_bounds(package, bounds)
+                    return True
 
-        cmd_lobby = f"am start -W {opt} -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p {package}"
-        ok3, _ = cls.run(cmd_lobby)
-        return ok3
+        # Fallback cuối cùng: Monkey Launcher
+        cls.run(f"monkey -p {package} -c android.intent.category.LAUNCHER 1")
+        if freeform and bounds:
+            time.sleep(0.4)
+            cls.apply_task_bounds(package, bounds)
+        return True
 
     @classmethod
     def launch_lobby_only(
@@ -773,7 +803,6 @@ done
                 break
             pkg = target.package
             self.package_status[pkg] = "Warmup..."
-            # Mở app thuần túy lên sảnh (không bounds, không sort)
             RootController.launch_lobby_only(pkg, freeform=False, bounds=None)
             time.sleep(2.5)
             
@@ -834,7 +863,7 @@ done
                     )
 
                     self._launch_timestamps[pkg] = time.monotonic()
-                    time.sleep(2.0)
+                    time.sleep(2.5)
                     continue
 
                 # TRƯỜNG HỢP 2: APP ĐANG CHẠY -> GIÁM SÁT SỨC KHỎE WATCHDOG
