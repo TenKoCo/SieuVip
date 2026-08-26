@@ -1127,40 +1127,52 @@ class AndroidController:
         freeform: bool = True,
         bounds: Optional[str] = None,
     ) -> Tuple[bool, str]:
-        options: List[str] = []
+        option_variants: List[List[str]] = []
         if freeform and bounds:
-            options.extend(["--windowingMode", "5", "--bounds", bounds, "-f", "0x10000000"])
-        elif freeform:
-            options.extend(["--windowingMode", "5", "-f", "0x10000000"])
+            option_variants.append(["--windowingMode", "5", "--bounds", bounds])
+        if freeform:
+            option_variants.append(["--windowingMode", "5"])
+        option_variants.append([])
 
-        if ticket:
-            res = self.backend.run(
-                ["am", "start", "-W", *options, "-a", "android.intent.action.VIEW", "-d", f"roblox://navigation/home?ticket={urllib.parse.quote(ticket)}", "-p", package],
+        for options in option_variants:
+            if ticket:
+                res = self.backend.run(
+                    ["am", "start", *options, "-a", "android.intent.action.VIEW", "-d", f"roblox://navigation/home?ticket={urllib.parse.quote(ticket)}", "-p", package],
+                    timeout=self.command_timeout,
+                )
+                if self.command_accepted(res):
+                    if bounds:
+                        self.apply_window_bounds_directly(package, bounds)
+                    return True, res.output
+
+            result = self.backend.run(
+                [
+                    "am",
+                    "start",
+                    *options,
+                    "-a",
+                    "android.intent.action.MAIN",
+                    "-c",
+                    "android.intent.category.LAUNCHER",
+                    "-p",
+                    package,
+                ],
                 timeout=self.command_timeout,
             )
-            if self.command_accepted(res):
+            if self.command_accepted(result):
                 if bounds:
                     self.apply_window_bounds_directly(package, bounds)
-                return True, res.output
+                return True, result.output
 
-        result = self.backend.run(
-            [
-                "am",
-                "start",
-                "-W",
-                *options,
-                "-a",
-                "android.intent.action.MAIN",
-                "-c",
-                "android.intent.category.LAUNCHER",
-                "-p",
-                package,
-            ],
-            timeout=self.command_timeout,
-        )
-        if self.command_accepted(result) and bounds:
-            self.apply_window_bounds_directly(package, bounds)
-        return self.command_accepted(result), result.output
+        # Phương án dự phòng cuối cùng: Monkey Launcher
+        monkey_res = self.backend.run(["monkey", "-p", package, "-c", "android.intent.category.LAUNCHER", "1"], timeout=8)
+        if monkey_res.ok:
+            if bounds:
+                time.sleep(0.5)
+                self.apply_window_bounds_directly(package, bounds)
+            return True, "Monkey launch OK"
+
+        return False, "Không thể khởi chạy sảnh Roblox"
 
     def start_deep_link(
         self,
@@ -1174,50 +1186,53 @@ class AndroidController:
         if not spec.is_valid():
             return False, "Link/Place ID không hợp lệ"
 
-        options: List[str] = []
+        option_variants: List[List[str]] = []
         if freeform and bounds:
-            options.extend(["--windowingMode", "5", "--bounds", bounds, "-f", "0x10000000"])
-        elif freeform:
-            options.extend(["--windowingMode", "5", "-f", "0x10000000"])
+            option_variants.append(["--windowingMode", "5", "--bounds", bounds])
+        if freeform:
+            option_variants.append(["--windowingMode", "5"])
+        option_variants.append([])
 
         urls = spec.candidate_urls(ticket=ticket)
         errors: List[str] = []
 
         for url in urls:
-            intents: List[List[str]] = []
-            for act in self.KNOWN_ACTIVITIES:
+            for options in option_variants:
+                intents: List[List[str]] = []
+                for act in self.KNOWN_ACTIVITIES:
+                    intents.append([
+                        "am", "start", *options,
+                        "-a", "android.intent.action.VIEW",
+                        "-d", url,
+                        "-n", f"{package}/{act}",
+                    ])
                 intents.append([
-                    "am", "start", "-W", *options,
-                    "-a", "android.intent.action.VIEW",
-                    "-d", url,
-                    "-n", f"{package}/{act}",
-                ])
-            intents.append([
-                "am", "start", "-W", *options,
-                "-a", "android.intent.action.VIEW",
-                "-d", url,
-                "-p", package,
-            ])
-            if ticket and spec.place_id:
-                intents.append([
-                    "am", "start", "-W", *options,
+                    "am", "start", *options,
                     "-a", "android.intent.action.VIEW",
                     "-d", url,
                     "-p", package,
-                    "--es", "ticket", ticket,
-                    "--es", "placeId", spec.place_id,
                 ])
+                if ticket and spec.place_id:
+                    intents.append([
+                        "am", "start", *options,
+                        "-a", "android.intent.action.VIEW",
+                        "-d", url,
+                        "-p", package,
+                        "--es", "ticket", ticket,
+                        "--es", "placeId", spec.place_id,
+                    ])
 
-            for argv in intents:
-                result = self.backend.run(argv, timeout=self.command_timeout)
-                if self.command_accepted(result):
-                    if bounds:
-                        time.sleep(0.3)
-                        self.apply_window_bounds_directly(package, bounds)
-                    return True, result.output or "OK"
-                errors.append(result.output or f"rc={result.returncode}")
+                for argv in intents:
+                    result = self.backend.run(argv, timeout=self.command_timeout)
+                    if self.command_accepted(result):
+                        if bounds:
+                            time.sleep(0.3)
+                            self.apply_window_bounds_directly(package, bounds)
+                        return True, result.output or "OK"
+                    errors.append(result.output or f"rc={result.returncode}")
 
-        return False, " | ".join(_compact(item, 180) for item in errors[-3:])
+        # Tự động chuyển sang mở sảnh nếu deep link không vào được
+        return self.start_lobby(package, ticket=ticket, freeform=freeform, bounds=bounds)
 
     def list_packages(self) -> Tuple[List[str], str]:
         result = self.backend.run(["pm", "list", "packages"], timeout=30)
@@ -1258,7 +1273,7 @@ class AndroidController:
 
 
 class RealtimeDashboardEngine:
-    """Dashboard tự động xóa sạch màn hình mỗi giây, hiển thị CPU & RAM gọn gàng."""
+    """Dashboard tự động xóa sạch màn hình mỗi giây, hiển thị CPU & RAM căn giữa hoàn hảo."""
 
     def __init__(
         self,
@@ -1375,15 +1390,15 @@ done
         return None, "No Heartbeat"
 
     def _render_ui(self) -> None:
-        """Xóa sạch màn hình hoàn toàn mỗi giây, bảng gọn gàng kèm CPU & RAM."""
+        """Xóa sạch màn hình hoàn toàn mỗi giây, bảng gọn gàng kèm CPU & RAM căn giữa."""
         cpu, ram = SystemMonitor.get_stats()
 
         sys.stdout.write("\033[2J\033[3J\033[H")
         sys.stdout.flush()
 
         print(f"{Colors.BLUE}{'─' * 56}{Colors.RESET}")
-        stats_str = f"CPU: {cpu:.1f}% | RAM: {ram:.1f}%"
-        print(f"{Colors.YELLOW}{stats_str: >56}{Colors.RESET}")
+        stats_str = f"CPU: {cpu:.1f}%  |  RAM: {ram:.1f}%"
+        print(f"{Colors.YELLOW}{stats_str: ^56}{Colors.RESET}")
         print(f"{Colors.BLUE}{'─' * 56}{Colors.RESET}")
 
         print(f" {Colors.MAGENTA}{'Package': <17}{Colors.RESET}│ {Colors.MAGENTA}{'Username': <14}{Colors.RESET}│ {Colors.MAGENTA}{'Status': <18}{Colors.RESET}")
@@ -1458,13 +1473,13 @@ done
                     self.controller.start_deep_link(
                         pkg,
                         spec,
-                        freeform=True,
+                        freeform=self.config.freeform or self.config.auto_arrange,
                         bounds=calculated_bounds,
                         ticket=ticket,
                     )
+
                     self._launch_timestamps[pkg] = time.monotonic()
                     time.sleep(2.5)
-                    self.package_status[pkg] = "Joining..."
                 else:
                     if self.config.health_check_method == "heartbeat":
                         ts, _ = self._read_local_heartbeat(pkg)
