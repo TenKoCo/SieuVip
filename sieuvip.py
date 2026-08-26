@@ -442,6 +442,16 @@ class RootController:
         return ok
 
     @classmethod
+    def wait_until_stopped(cls, package: str, timeout: float = 5.0) -> bool:
+        """Chờ Android đóng tiến trình hẳn trước khi gửi deep link mới."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not cls.is_running(package):
+                return True
+            time.sleep(0.25)
+        return not cls.is_running(package)
+
+    @classmethod
     def list_installed_packages(cls) -> List[str]:
         ok, out = cls.run("pm list packages")
         if not ok:
@@ -493,22 +503,6 @@ fi
         cls.run(script)
 
     @classmethod
-    def apply_task_bounds(cls, package: str, bounds: str) -> None:
-        """Định hình kích thước và toạ độ cửa sổ nổi cho package."""
-        if not bounds:
-            return
-        parts = [p.strip() for p in bounds.split(",") if p.strip()]
-        if len(parts) != 4:
-            return
-        l, t, r, b = parts
-        ok, out = cls.run(f"dumpsys activity tasks | grep -B 2 '{package}' | grep 'Task{{' | head -n 1")
-        m = re.search(r"Task\{[a-f0-9]+ #(\d+)", out)
-        if m:
-            task_id = m.group(1)
-            cls.run(f"am task move-to-freeform {task_id} {l} {t} {r} {b}")
-            cls.run(f"am task resize {task_id} {l} {t} {r} {b}")
-
-    @classmethod
     def launch(
         cls,
         package: str,
@@ -537,40 +531,28 @@ fi
             params["ticket"] = ticket
 
         deep_link = f"roblox://experiences/start?{urllib.parse.urlencode(params)}"
-        deep_link_short = f"roblox://{urllib.parse.urlencode(params)}"
 
-        opt_variants = []
+        opt = ""
         if freeform and bounds:
-            opt_variants.append(f"--windowingMode 5 --bounds {bounds}")
-        if freeform:
-            opt_variants.append("--windowingMode 5")
-        opt_variants.append("")
+            opt = f"--windowingMode 5 --bounds {bounds}"
+        elif freeform:
+            opt = "--windowingMode 5"
 
-        intents_to_try = [
-            # 1. Deep link URL standard
-            lambda opt: f"am start {opt} -a android.intent.action.VIEW -d '{deep_link}' -p {package}",
-            # 2. Short Deep Link
-            lambda opt: f"am start {opt} -a android.intent.action.VIEW -d '{deep_link_short}' -p {package}",
-            # 3. Explicit launcher with intent
-            lambda opt: f"am start {opt} -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p {package}",
-        ]
+        cmd = f"am start -W {opt} -a android.intent.action.VIEW -d {shlex.quote(deep_link)} -p {shlex.quote(package)}"
+        ok, out = cls.run(cmd)
+        bad_markers = ("error", "exception", "unable to resolve", "activity not started")
+        if ok and not any(marker in out.lower() for marker in bad_markers):
+            return True
 
-        for intent_fn in intents_to_try:
-            for opt in opt_variants:
-                cmd = intent_fn(opt).strip()
-                ok, out = cls.run(cmd)
-                if ok and "error" not in out.lower() and "unable to resolve" not in out.lower():
-                    if freeform and bounds:
-                        time.sleep(0.3)
-                        cls.apply_task_bounds(package, bounds)
-                    return True
+        # Giữ nguyên dấu '=' và '&'; bản cũ encode cả chuỗi nên Roblox không đọc được placeId.
+        legacy_link = "roblox://" + urllib.parse.urlencode(params)
+        cmd_fallback = f"am start -W {opt} -a android.intent.action.VIEW -d {shlex.quote(legacy_link)} -p {shlex.quote(package)}"
+        ok2, out2 = cls.run(cmd_fallback)
+        if ok2 and not any(marker in out2.lower() for marker in bad_markers):
+            return True
 
-        # Fallback cuối cùng: Monkey Launcher
-        cls.run(f"monkey -p {package} -c android.intent.category.LAUNCHER 1")
-        if freeform and bounds:
-            time.sleep(0.4)
-            cls.apply_task_bounds(package, bounds)
-        return True
+        # Không mở lobby rồi báo thành công; caller sẽ retry rejoin.
+        return False
 
     @classmethod
     def launch_lobby_only(
@@ -795,7 +777,7 @@ done
             pkg = target.package
             self.package_status[pkg] = "Closing..."
             RootController.force_stop(pkg)
-            time.sleep(0.3)
+            RootController.wait_until_stopped(pkg)
 
         # BƯỚC 1: MỞ LẦN LƯỢT TỪNG APP (KHÔNG JOIN GAME, KHÔNG SORT) RỒI ĐÓNG LẠI
         for target in enabled:
@@ -803,13 +785,15 @@ done
                 break
             pkg = target.package
             self.package_status[pkg] = "Warmup..."
+            # Mở app thuần túy lên sảnh (không bounds, không sort)
             RootController.launch_lobby_only(pkg, freeform=False, bounds=None)
-            time.sleep(2.5)
+            time.sleep(self.config.warmup_seconds)
             
             # Đóng app
             self.package_status[pkg] = "Closing..."
             RootController.force_stop(pkg)
-            time.sleep(0.8)
+            RootController.wait_until_stopped(pkg)
+            time.sleep(max(0.8, self.config.between_apps_seconds))
             self.package_status[pkg] = "Waiting..."
 
     def _worker_loop(self) -> None:
@@ -854,16 +838,33 @@ done
                     RootController.run("rm -f /sdcard/Delta/workspace/sv_heartbeat.main /sdcard/Download/sv_heartbeat.main 2>/dev/null")
 
                     # Khởi chạy vào Game và xếp cửa sổ theo Grid Bounds
-                    RootController.launch(
-                        pkg,
-                        target.link,
-                        ticket=ticket,
-                        freeform=self.config.freeform or self.config.auto_arrange,
-                        bounds=calculated_bounds,
-                    )
+                    launched = False
+                    for attempt in range(self.config.retries + 1):
+                        launched = RootController.launch(
+                            pkg,
+                            target.link,
+                            ticket=ticket,
+                            freeform=self.config.freeform or self.config.auto_arrange,
+                            bounds=calculated_bounds,
+                        )
+                        if launched:
+                            deadline = time.monotonic() + 8.0
+                            while time.monotonic() < deadline and not RootController.is_running(pkg):
+                                time.sleep(0.4)
+                            launched = RootController.is_running(pkg)
+                        if launched:
+                            break
+                        self.logger.warning("Rejoin %s thất bại (lần %d)", pkg, attempt + 1)
+                        RootController.force_stop(pkg)
+                        RootController.wait_until_stopped(pkg)
+                        time.sleep(self.config.retry_backoff_seconds * (attempt + 1))
 
-                    self._launch_timestamps[pkg] = time.monotonic()
-                    time.sleep(2.5)
+                    if launched:
+                        self._launch_timestamps[pkg] = time.monotonic()
+                        self.package_status[pkg] = "Waiting Key..."
+                    else:
+                        self.package_status[pkg] = "Rejoin Failed"
+                    time.sleep(self.config.between_apps_seconds)
                     continue
 
                 # TRƯỜNG HỢP 2: APP ĐANG CHẠY -> GIÁM SÁT SỨC KHỎE WATCHDOG
