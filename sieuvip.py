@@ -776,7 +776,8 @@ def mask_username(username: Optional[str]) -> str:
     return ("*" * max(4, masked_len)) + s[-visible_len:]
 
 
-def inject_direct_root_cookies(backend: AndroidBackend, package: str, raw_cookie: str) -> None:
+def inject_direct_root_cookies(backend: AndroidBackend, package: str, raw_cookie: str, username: Optional[str] = None) -> None:
+    """Tiêm Cookie vĩnh viễn vào SQLite WebView & SharedPreferences và bảo toàn phân quyền để app không bị logout."""
     if not backend.can_write_app_data:
         return
 
@@ -803,47 +804,71 @@ def inject_direct_root_cookies(backend: AndroidBackend, package: str, raw_cookie
         );
         """)
         now_micro = int((time.time() + 11644473600) * 1000000)
-        expire_micro = int((time.time() + 11644473600 + 315360000) * 1000000)
-        cur.execute("""
-        INSERT INTO cookies VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            now_micro, ".roblox.com", "", ".ROBLOSECURITY", full_session, b"", "/",
-            expire_micro, 1, 1, now_micro, 1, 1, 1, 0, 2, 443, 0, now_micro
-        ))
+        expire_micro = int((time.time() + 11644473600 + 630720000) * 1000000) # 20 năm sau
+        
+        # Tiêm vào cả domain gốc và subdomain
+        domains = [".roblox.com", "www.roblox.com", "roblox.com", ".web.roblox.com"]
+        for dom in domains:
+            cur.execute("""
+            INSERT INTO cookies VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                now_micro, dom, "", ".ROBLOSECURITY", full_session, b"", "/",
+                expire_micro, 1, 1, now_micro, 1, 1, 1, 0, 2, 443, 0, now_micro
+            ))
+            cur.execute("""
+            INSERT INTO cookies VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                now_micro, dom, "", "RBXSessionTracker", full_session, b"", "/",
+                expire_micro, 1, 0, now_micro, 1, 1, 1, 0, 2, 443, 0, now_micro
+            ))
         conn.commit()
         conn.close()
     except Exception:
         pass
+
+    user_tag = f'<string name="username">{username}</string>' if username else ''
 
     script = f"""
 pkg="{package}"
 app_dir="/data/data/$pkg"
 [ ! -d "$app_dir" ] && app_dir="/data/user/0/$pkg"
 if [ -d "$app_dir" ]; then
-    owner=$(stat -c '%u:%g' "$app_dir" 2>/dev/null || echo "10000:10000")
-    if [ -f "{temp_db}" ]; then
-        for wdir in "$app_dir/app_webview" "$app_dir/app_webview/Default"; do
-            mkdir -p "$wdir"
-            cp "{temp_db}" "$wdir/Cookies" 2>/dev/null
-            chmod 660 "$wdir/Cookies" 2>/dev/null
-        done
-    fi
+    # Lấy UID/GID chính xác của App để tránh bị lỗi quyền (Permission Denied) khiến App tự logout
+    owner=$(stat -c '%u:%g' "$app_dir" 2>/dev/null)
+    [ -z "$owner" ] && owner="10000:10000"
 
+    # Xóa file lock/journal cũ để SQLite nạp dữ liệu sạch
+    for wdir in "$app_dir/app_webview" "$app_dir/app_webview/Default"; do
+        mkdir -p "$wdir"
+        rm -f "$wdir/Cookies-journal" "$wdir/Cookies-wal" "$wdir/Cookies-shm"
+        if [ -f "{temp_db}" ]; then
+            cp -f "{temp_db}" "$wdir/Cookies" 2>/dev/null
+            chmod 660 "$wdir/Cookies" 2>/dev/null
+            chown "$owner" "$wdir/Cookies" 2>/dev/null
+        fi
+    done
+
+    # Cập nhật SharedPreferences lưu trữ phiên đăng nhập vĩnh viễn
     mkdir -p "$app_dir/shared_prefs"
-    for xml in "com.roblox.client_preferences.xml" "${{pkg}}_preferences.xml"; do
+    for xml in "com.roblox.client_preferences.xml" "${{pkg}}_preferences.xml" "AppStorage.xml"; do
         cat << 'EOF_XML' > "$app_dir/shared_prefs/$xml"
 <?xml version='1.0' encoding='utf-8' standalone='yes' ?>
 <map>
     <string name="RBXSession">{full_session}</string>
     <string name="RBXSessionToken">{full_session}</string>
     <string name=".ROBLOSECURITY">{token}</string>
+    <boolean name="isLoggedIn" value="true" />
+    <string name="GuestData">{token}</string>
+    {user_tag}
 </map>
 EOF_XML
-        chmod 660 "$app_dir/shared_prefs/$xml"
+        chmod 660 "$app_dir/shared_prefs/$xml" 2>/dev/null
+        chown "$owner" "$app_dir/shared_prefs/$xml" 2>/dev/null
     done
 
+    # Cấp toàn quyền Read/Write cho UID của App đối với toàn bộ thư mục dữ liệu
     chown -R "$owner" "$app_dir" 2>/dev/null
-    chmod 771 "$app_dir/app_webview" "$app_dir/shared_prefs" 2>/dev/null
+    chmod 771 "$app_dir" "$app_dir/app_webview" "$app_dir/app_webview/Default" "$app_dir/shared_prefs" "$app_dir/databases" 2>/dev/null
 fi
 rm -f "{temp_db}"
 """
@@ -1250,11 +1275,9 @@ done
 
     def _render_ui(self) -> None:
         """Xóa sạch màn hình hoàn toàn mỗi giây, bảng gọn gàng vừa màn hình điện thoại."""
-        # Xóa sạch màn hình và bộ đệm Termux hoàn toàn
         sys.stdout.write("\033[2J\033[3J\033[H")
         sys.stdout.flush()
 
-        # Bảng hiển thị tối ưu kích thước màn hình
         print(f"{Colors.BLUE}{'─' * 56}{Colors.RESET}")
         print(f" {Colors.MAGENTA}{'Package': <17}{Colors.RESET}│ {Colors.MAGENTA}{'Username': <14}{Colors.RESET}│ {Colors.MAGENTA}{'Status': <18}{Colors.RESET}")
         print(f"{'─' * 18}┼{'─' * 16}┼{'─' * 20}")
@@ -1264,7 +1287,6 @@ done
             user = self.package_users.get(pkg, "Unknown")
             status = self.package_status.get(pkg, "Waiting...")
             
-            # Cắt bớt nếu tên package dài quá
             display_pkg = (pkg[:16] + "…") if len(pkg) > 17 else pkg
             display_user = (user[:13] + "…") if len(user) > 14 else user
 
@@ -1302,6 +1324,7 @@ done
                     spec = RobloxLaunchSpec.parse(target.link)
                     
                     ticket = None
+                    raw_c = None
                     if cookies:
                         raw_c = cookies[idx % len(cookies)]
                         ok, user, tk, _ = RobloxAuthSystem.get_auth_ticket(raw_c)
@@ -1310,6 +1333,10 @@ done
                             if user:
                                 self.package_users[pkg] = mask_username(user)
                     
+                    # Bảo đảm nạp cookie trước khi khởi chạy lại
+                    if raw_c and self.controller.backend.can_write_app_data:
+                        inject_direct_root_cookies(self.controller.backend, pkg, raw_c, self.package_users.get(pkg))
+
                     self.controller.start_deep_link(
                         pkg,
                         spec,
@@ -1346,7 +1373,6 @@ done
         signal.signal(signal.SIGINT, self.request_stop)
         signal.signal(signal.SIGTERM, self.request_stop)
 
-        # Xóa sạch màn hình ban đầu
         sys.stdout.write("\033[2J\033[3J\033[H")
         sys.stdout.flush()
 
@@ -1492,14 +1518,17 @@ def _menu_login_cookie(
 
         print(f"{Colors.GREEN}[+] Tài khoản: {user} | Lấy Auth Ticket thành công!{Colors.RESET}")
 
+        # 1. Tiêm SQLite WebView & SharedPreferences kèm phân quyền chính xác
         if controller.backend.can_write_app_data:
-            print(f"{Colors.CYAN}[*] Đang nạp Cookie vào SQLite WebView...{Colors.RESET}")
-            inject_direct_root_cookies(controller.backend, target.package, raw_cookie)
+            print(f"{Colors.CYAN}[*] Đang nạp Cookie & Lưu phiên đăng nhập vĩnh viễn...{Colors.RESET}")
+            inject_direct_root_cookies(controller.backend, target.package, raw_cookie, user)
 
+        # 2. Force Stop để nạp dữ liệu sạch
         if controller.backend.can_force_stop:
             controller.force_stop(target.package)
             time.sleep(0.6)
 
+        # 3. Mở app vào Sảnh
         opened, detail = controller.start_lobby(
             target.package,
             ticket=ticket,
