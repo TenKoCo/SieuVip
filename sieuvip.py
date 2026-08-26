@@ -82,7 +82,6 @@ class Colors:
     RED = "\033[31m"
     BLUE = "\033[34m"
     GRAY = "\033[90m"
-    WHITE = "\033[97m"
 
 
 class AppError(RuntimeError):
@@ -313,47 +312,6 @@ def setup_logger(log_path: Path, verbose: bool = False) -> logging.Logger:
     except OSError:
         pass
     return logger
-
-
-class SystemMonitor:
-    """Đọc CPU và RAM trực tiếp từ /proc của Android."""
-    _prev_total = 0
-    _prev_idle = 0
-
-    @classmethod
-    def get_stats(cls) -> Tuple[float, float]:
-        cpu_percent = 0.0
-        ram_percent = 0.0
-
-        try:
-            with open("/proc/stat", "r") as f:
-                fields = [float(col) for col in f.readline().strip().split()[1:8]]
-            idle = fields[3] + fields[4]
-            total = sum(fields)
-            if cls._prev_total != 0:
-                total_diff = total - cls._prev_total
-                idle_diff = idle - cls._prev_idle
-                if total_diff > 0:
-                    cpu_percent = max(0.0, min(100.0, (1.0 - idle_diff / total_diff) * 100.0))
-            cls._prev_total = total
-            cls._prev_idle = idle
-        except Exception:
-            cpu_percent = random.uniform(20.0, 45.0)
-
-        try:
-            mem = {}
-            with open("/proc/meminfo", "r") as f:
-                for line in f:
-                    parts = line.split(":")
-                    if len(parts) == 2:
-                        mem[parts[0].strip()] = float(parts[1].strip().split()[0])
-            total = mem.get("MemTotal", 1.0)
-            avail = mem.get("MemAvailable", mem.get("MemFree", 0.0))
-            ram_percent = max(0.0, min(100.0, ((total - avail) / total) * 100.0))
-        except Exception:
-            ram_percent = random.uniform(40.0, 50.0)
-
-        return cpu_percent, ram_percent
 
 
 class SingleInstance:
@@ -659,18 +617,14 @@ class RobloxAuthSystem:
 
     @staticmethod
     def extract_raw_cookie(line: str) -> str:
-        """Tách chuỗi cookie từ các dòng user:pass:cookie hoặc user|pass|cookie."""
         s = str(line).strip().strip("'\"")
-        
         match = re.search(r"(?i)\.ROBLOSECURITY\s*=\s*([^;\s]+)", s)
         if match:
             return match.group(1).strip()
-
         if "_|WARNING:" in s:
             match = re.search(r"(_\|WARNING:[^;\r\n]+)", s)
             if match:
                 return match.group(1).strip()
-
         if ":" in s and not s.startswith("http"):
             parts = s.split(":")
             for p in reversed(parts):
@@ -683,7 +637,6 @@ class RobloxAuthSystem:
                 p = p.strip()
                 if len(p) > 100:
                     return p
-
         return s
 
     @classmethod
@@ -722,11 +675,9 @@ class RobloxAuthSystem:
                     username = data.get("name")
             except urllib.error.HTTPError as err:
                 if err.code == 401:
-                    last_error = "Cookie bị từ chối (HTTP 401: Khóa IP hoặc hết hạn)"
+                    last_error = "Cookie bị từ chối (HTTP 401)"
                 elif err.code == 429:
-                    last_error = "Roblox đang tạm chặn Rate Limit (HTTP 429). Hãy đợi 1-2 phút"
-                elif err.code == 403:
-                    last_error = "Roblox Cloudflare WAF chặn kết nối (HTTP 403)"
+                    last_error = "Rate Limit (HTTP 429)"
                 else:
                     last_error = f"Lỗi HTTP {err.code}"
                 continue
@@ -757,10 +708,10 @@ class RobloxAuthSystem:
             except urllib.error.HTTPError as err:
                 csrf_token = err.headers.get("x-csrf-token")
             except Exception as err:
-                return False, username, None, f"Lỗi lấy CSRF: {err}"
+                return False, username, None, f"Lỗi CSRF: {err}"
 
             if not csrf_token:
-                return False, username, None, "Không lấy được x-csrf-token từ Roblox"
+                return False, username, None, "Không lấy được x-csrf-token"
 
             # 3. Yêu cầu cấp Auth Ticket
             req_ticket = urllib.request.Request(
@@ -781,24 +732,21 @@ class RobloxAuthSystem:
                 with urllib.request.urlopen(req_ticket, timeout=12, context=SSL_CONTEXT) as resp:
                     ticket = resp.headers.get("rbx-authentication-ticket")
                     if ticket:
-                        return True, username, ticket.strip(), "Cấp Ticket thành công"
+                        return True, username, ticket.strip(), "OK"
                     body = resp.read().decode("utf-8", errors="replace")
                     try:
                         data = json.loads(body)
                         if "authenticationTicket" in data:
-                            return True, username, str(data["authenticationTicket"]).strip(), "Cấp Ticket thành công"
+                            return True, username, str(data["authenticationTicket"]).strip(), "OK"
                     except Exception:
                         pass
-            except urllib.error.HTTPError as err:
-                return False, username, None, f"Roblox từ chối cấp ticket (HTTP {err.code})"
             except Exception as err:
-                return False, username, None, f"Lỗi lấy ticket: {err}"
+                return False, username, None, f"Lỗi Ticket: {err}"
 
         return False, None, None, (last_error or "Không thể xác thực cookie")
 
 
 def ensure_cookie_file(path: Path) -> List[str]:
-    """Tự động tạo file cookie.txt nếu chưa có và đọc danh sách cookie."""
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         if not path.exists():
@@ -818,7 +766,6 @@ def ensure_cookie_file(path: Path) -> List[str]:
 
 
 def mask_username(username: Optional[str]) -> str:
-    """Che bớt username định dạng giống ảnh: *******KIRA222."""
     if not username or username.startswith("Unknown"):
         return "Unknown"
     s = str(username).strip()
@@ -826,11 +773,10 @@ def mask_username(username: Optional[str]) -> str:
         return "****" + s[-2:]
     visible_len = min(6, max(3, len(s) // 2))
     masked_len = len(s) - visible_len
-    return ("*" * max(5, masked_len)) + s[-visible_len:]
+    return ("*" * max(4, masked_len)) + s[-visible_len:]
 
 
 def inject_direct_root_cookies(backend: AndroidBackend, package: str, raw_cookie: str) -> None:
-    """Tiêm trực tiếp Cookie vào SQLite WebView & SharedPreferences khi có quyền Root."""
     if not backend.can_write_app_data:
         return
 
@@ -840,7 +786,6 @@ def inject_direct_root_cookies(backend: AndroidBackend, package: str, raw_cookie
         f"_|WARNING:-DO-NOT-SHARE-THIS.--Sharing-this-will-allow-someone-to-log-into-your-account-and-rob-your-robox.--|_{token}"
     )
 
-    # 1. Tạo SQLite Cookies DB
     temp_db = "/sdcard/Download/tmp_cookies.db"
     try:
         if os.path.exists(temp_db):
@@ -849,35 +794,18 @@ def inject_direct_root_cookies(backend: AndroidBackend, package: str, raw_cookie
         cur = conn.cursor()
         cur.execute("""
         CREATE TABLE IF NOT EXISTS cookies (
-            creation_utc INTEGER NOT NULL,
-            host_key TEXT NOT NULL,
-            top_frame_site_key TEXT NOT NULL,
-            name TEXT NOT NULL,
-            value TEXT NOT NULL,
-            encrypted_value BLOB NOT NULL,
-            path TEXT NOT NULL,
-            expires_utc INTEGER NOT NULL,
-            is_secure INTEGER NOT NULL,
-            is_httponly INTEGER NOT NULL,
-            last_access_utc INTEGER NOT NULL,
-            has_expires INTEGER NOT NULL,
-            is_persistent INTEGER NOT NULL,
-            priority INTEGER NOT NULL,
-            samesite INTEGER NOT NULL,
-            source_scheme INTEGER NOT NULL,
-            source_port INTEGER NOT NULL,
-            is_same_party INTEGER NOT NULL,
-            last_update_utc INTEGER NOT NULL
+            creation_utc INTEGER NOT NULL, host_key TEXT NOT NULL, top_frame_site_key TEXT NOT NULL,
+            name TEXT NOT NULL, value TEXT NOT NULL, encrypted_value BLOB NOT NULL, path TEXT NOT NULL,
+            expires_utc INTEGER NOT NULL, is_secure INTEGER NOT NULL, is_httponly INTEGER NOT NULL,
+            last_access_utc INTEGER NOT NULL, has_expires INTEGER NOT NULL, is_persistent INTEGER NOT NULL,
+            priority INTEGER NOT NULL, samesite INTEGER NOT NULL, source_scheme INTEGER NOT NULL,
+            source_port INTEGER NOT NULL, is_same_party INTEGER NOT NULL, last_update_utc INTEGER NOT NULL
         );
         """)
         now_micro = int((time.time() + 11644473600) * 1000000)
         expire_micro = int((time.time() + 11644473600 + 315360000) * 1000000)
         cur.execute("""
-        INSERT INTO cookies (
-            creation_utc, host_key, top_frame_site_key, name, value, encrypted_value, path,
-            expires_utc, is_secure, is_httponly, last_access_utc, has_expires, is_persistent,
-            priority, samesite, source_scheme, source_port, is_same_party, last_update_utc
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO cookies VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             now_micro, ".roblox.com", "", ".ROBLOSECURITY", full_session, b"", "/",
             expire_micro, 1, 1, now_micro, 1, 1, 1, 0, 2, 443, 0, now_micro
@@ -887,15 +815,12 @@ def inject_direct_root_cookies(backend: AndroidBackend, package: str, raw_cookie
     except Exception:
         pass
 
-    # 2. Tiêm vào /data/data/$pkg
     script = f"""
 pkg="{package}"
 app_dir="/data/data/$pkg"
 [ ! -d "$app_dir" ] && app_dir="/data/user/0/$pkg"
 if [ -d "$app_dir" ]; then
     owner=$(stat -c '%u:%g' "$app_dir" 2>/dev/null || echo "10000:10000")
-    
-    # Tiêm SQLite WebView Cookies
     if [ -f "{temp_db}" ]; then
         for wdir in "$app_dir/app_webview" "$app_dir/app_webview/Default"; do
             mkdir -p "$wdir"
@@ -904,7 +829,6 @@ if [ -d "$app_dir" ]; then
         done
     fi
 
-    # Tiêm XML SharedPreferences
     mkdir -p "$app_dir/shared_prefs"
     for xml in "com.roblox.client_preferences.xml" "${{pkg}}_preferences.xml"; do
         cat << 'EOF_XML' > "$app_dir/shared_prefs/$xml"
@@ -919,8 +843,7 @@ EOF_XML
     done
 
     chown -R "$owner" "$app_dir" 2>/dev/null
-    chmod 771 "$app_dir/app_webview" 2>/dev/null
-    chmod 771 "$app_dir/shared_prefs" 2>/dev/null
+    chmod 771 "$app_dir/app_webview" "$app_dir/shared_prefs" 2>/dev/null
 fi
 rm -f "{temp_db}"
 """
@@ -1066,25 +989,8 @@ class AndroidController:
             r"(?m)^\s*\d+\s*$", current_user.stdout or current_user.output
         ):
             return True, current_user.output
-
         help_result = self.backend.run(["am", "help"], timeout=12)
-        help_text = help_result.output.lower()
-        help_is_valid = (
-            "activity manager" in help_text
-            and "start-activity" in help_text
-            and not any(
-                marker in help_text
-                for marker in (
-                    "securityexception",
-                    "permission denial",
-                    "not allowed",
-                    "not found",
-                )
-            )
-        )
-        if help_is_valid:
-            return True, help_result.output
-        return False, current_user.output or help_result.output
+        return help_result.ok, help_result.output
 
     def force_stop(self, package: str) -> Tuple[bool, str]:
         if not self.backend.can_force_stop:
@@ -1094,12 +1000,34 @@ class AndroidController:
         )
         return self.command_accepted(result), result.output
 
-    def start_lobby(self, package: str) -> Tuple[bool, str]:
+    def start_lobby(
+        self,
+        package: str,
+        *,
+        ticket: Optional[str] = None,
+        freeform: bool = False,
+        bounds: Optional[str] = None,
+    ) -> Tuple[bool, str]:
+        options: List[str] = []
+        if freeform and bounds:
+            options.extend(["--windowingMode", "5", "--bounds", bounds])
+        elif freeform:
+            options.extend(["--windowingMode", "5"])
+
+        if ticket:
+            res = self.backend.run(
+                ["am", "start", "-W", *options, "-a", "android.intent.action.VIEW", "-d", f"roblox://navigation/home?ticket={urllib.parse.quote(ticket)}", "-p", package],
+                timeout=self.command_timeout,
+            )
+            if self.command_accepted(res):
+                return True, res.output
+
         result = self.backend.run(
             [
                 "am",
                 "start",
                 "-W",
+                *options,
                 "-a",
                 "android.intent.action.MAIN",
                 "-c",
@@ -1136,8 +1064,6 @@ class AndroidController:
         for url in urls:
             for options in option_variants:
                 intents: List[List[str]] = []
-                
-                # 1. Thử từng Activity cụ thể của Roblox/Clone
                 for act in self.KNOWN_ACTIVITIES:
                     intents.append([
                         "am", "start", "-W", *options,
@@ -1145,16 +1071,12 @@ class AndroidController:
                         "-d", url,
                         "-n", f"{package}/{act}",
                     ])
-                
-                # 2. Thử intent kèm cờ Package
                 intents.append([
                     "am", "start", "-W", *options,
                     "-a", "android.intent.action.VIEW",
                     "-d", url,
                     "-p", package,
                 ])
-
-                # 3. Thử truyền tham số extras trực tiếp (--es ticket ...)
                 if ticket and spec.place_id:
                     intents.append([
                         "am", "start", "-W", *options,
@@ -1168,7 +1090,7 @@ class AndroidController:
                 for argv in intents:
                     result = self.backend.run(argv, timeout=self.command_timeout)
                     if self.command_accepted(result):
-                        return True, result.output or "Android đã nhận intent"
+                        return True, result.output or "OK"
                     errors.append(result.output or f"rc={result.returncode}")
 
         return False, " | ".join(_compact(item, 180) for item in errors[-3:])
@@ -1191,7 +1113,7 @@ class AndroidController:
             process_result.stdout.strip()
         )
         if not process_running:
-            return False, process_result.output or "Không thấy PID"
+            return False, "Không thấy PID"
 
         activity_result = self.backend.run(
             ["dumpsys", "activity", "-p", package, "activities"], timeout=15
@@ -1200,42 +1122,19 @@ class AndroidController:
             return True, process_result.output
         package_lower = package.lower()
         activity_markers = (
-            "activityrecord{",
-            "mresumedactivity",
-            "topresumedactivity",
-            "realactivity=",
-            "origactivity=",
-            "topactivity=",
-            "task{",
+            "activityrecord{", "mresumedactivity", "topresumedactivity",
+            "realactivity=", "origactivity=", "topactivity=", "task{",
         )
         task_running = any(
             package_lower in line.lower()
             and any(marker in line.lower() for marker in activity_markers)
             for line in activity_result.output.splitlines()
         )
-        if task_running:
-            return True, process_result.output
-        return False, "PID còn tồn tại nhưng không còn Activity Roblox"
-
-    def get_screen_size(self) -> Tuple[int, int]:
-        result = self.backend.run(["wm", "size"], timeout=10)
-        matches = re.findall(r"(?i)(\d+)x(\d+)", result.output)
-        if matches:
-            return tuple(map(int, matches[-1]))
-        return 720, 1280
-
-    def randomize_android_id(self) -> Tuple[bool, str]:
-        if not self.backend.can_write_secure_settings:
-            return False, "backend không cho phép ghi secure settings"
-        value = os.urandom(8).hex()
-        result = self.backend.run(
-            ["settings", "put", "secure", "android_id", value], timeout=15
-        )
-        return self.command_accepted(result), result.output
+        return (True, "OK") if task_running else (False, "Không còn Activity")
 
 
 class RealtimeDashboardEngine:
-    """Giao diện Dashboard cập nhật trạng thái thời gian thực mỗi 1 giây đúng mẫu ảnh."""
+    """Dashboard tự động xóa sạch màn hình mỗi giây, không tràn chữ, không lag."""
 
     def __init__(
         self,
@@ -1248,14 +1147,11 @@ class RealtimeDashboardEngine:
         self.logger = logger
         self.stop_requested = False
         self._ping_paths: Dict[str, str] = {}
-        
-        # Bảng trạng thái & Username
         self.package_status: Dict[str, str] = {t.package: "Waiting..." for t in self.config.targets}
         self.package_users: Dict[str, str] = {t.package: "Loading..." for t in self.config.targets}
         self._resolve_usernames()
 
     def _resolve_usernames(self) -> None:
-        """Đọc và lấy Username thực tế từ cookie hoặc file cookie.txt."""
         cookies = ensure_cookie_file(DEFAULT_COOKIE_SOURCE_PATH)
         for idx, target in enumerate(self.config.targets):
             if cookies:
@@ -1353,47 +1249,43 @@ done
         return None, "No Heartbeat"
 
     def _render_ui(self) -> None:
-        """Hiển thị bảng Dashboard theo thời gian thực đúng mẫu ảnh (không có dòng HWID)."""
-        cpu, ram = SystemMonitor.get_stats()
-        
-        # Đưa con trỏ terminal về góc trên cùng (Tránh chớp giật màn hình)
-        print("\033[H", end="")
-        
-        # 1. Stats CPU & RAM
-        print(f"{Colors.BLUE}{'─' * 88}{Colors.RESET}")
-        stats_str = f"CPU: {cpu:.2f}% | RAM: {ram:.1f}%"
-        print(f"{stats_str: >88}")
-        print(f"{Colors.BLUE}{'─' * 88}{Colors.RESET}")
+        """Xóa sạch màn hình hoàn toàn mỗi giây, bảng gọn gàng vừa màn hình điện thoại."""
+        # Xóa sạch màn hình và bộ đệm Termux hoàn toàn
+        sys.stdout.write("\033[2J\033[3J\033[H")
+        sys.stdout.flush()
 
-        # 2. Cột tiêu đề bảng
-        print(f"  {Colors.MAGENTA}{'Package': <22}{Colors.RESET}│ {Colors.MAGENTA}{'Username': <18}{Colors.RESET}│ {Colors.MAGENTA}{'Status': <40}{Colors.RESET}")
-        print(f"{'─' * 24}┼{'─' * 19}┼{'─' * 43}")
+        # Bảng hiển thị tối ưu kích thước màn hình
+        print(f"{Colors.BLUE}{'─' * 56}{Colors.RESET}")
+        print(f" {Colors.MAGENTA}{'Package': <17}{Colors.RESET}│ {Colors.MAGENTA}{'Username': <14}{Colors.RESET}│ {Colors.MAGENTA}{'Status': <18}{Colors.RESET}")
+        print(f"{'─' * 18}┼{'─' * 16}┼{'─' * 20}")
 
-        # 3. Hàng dữ liệu từng App
         for target in self.config.targets:
             pkg = target.package
             user = self.package_users.get(pkg, "Unknown")
             status = self.package_status.get(pkg, "Waiting...")
             
-            # Tô màu trạng thái đúng chuẩn
+            # Cắt bớt nếu tên package dài quá
+            display_pkg = (pkg[:16] + "…") if len(pkg) > 17 else pkg
+            display_user = (user[:13] + "…") if len(user) > 14 else user
+
             if status == "Joined":
                 status_colored = f"{Colors.GREEN}Joined{Colors.RESET}"
             elif "Joining" in status:
-                status_colored = f"{Colors.CYAN}{status}{Colors.RESET}"
+                status_colored = f"{Colors.CYAN}Joining...{Colors.RESET}"
             elif "Waiting" in status:
-                status_colored = f"{Colors.YELLOW}{status}{Colors.RESET}"
+                status_colored = f"{Colors.YELLOW}Rejoining...{Colors.RESET}"
             elif "Crash" in status or "Offline" in status:
-                status_colored = f"{Colors.RED}{status}{Colors.RESET}"
+                status_colored = f"{Colors.RED}Offline{Colors.RESET}"
             else:
-                status_colored = f"{Colors.CYAN}{status}{Colors.RESET}"
+                status_colored = f"{Colors.CYAN}{status[:18]}{Colors.RESET}"
 
-            print(f"  {Colors.CYAN}{pkg: <22}{Colors.RESET}│ {Colors.GREEN}{user: <18}{Colors.RESET}│ {status_colored: <50}")
+            print(f" {Colors.CYAN}{display_pkg: <17}{Colors.RESET}│ {Colors.GREEN}{display_user: <14}{Colors.RESET}│ {status_colored}")
 
-        print(f"{Colors.BLUE}{'─' * 88}{Colors.RESET}")
-        print(f"{Colors.GRAY}Nhấn Ctrl+C để dừng và quay lại Menu chính.{Colors.RESET}                                      ")
+        print(f"{Colors.BLUE}{'─' * 56}{Colors.RESET}")
+        print(f"{Colors.GRAY}Nhấn Ctrl+C để dừng và quay lại Menu.{Colors.RESET}")
+        sys.stdout.flush()
 
     def _worker_loop(self) -> None:
-        """Tiến trình ngầm kiểm tra và Rejoin game."""
         enabled = [t for t in self.config.targets if t.enabled]
         cookies = ensure_cookie_file(DEFAULT_COOKIE_SOURCE_PATH)
 
@@ -1406,7 +1298,7 @@ done
                 running, _ = self.controller.is_process_running(pkg)
                 
                 if not running:
-                    self.package_status[pkg] = f"Joining Roblox for {pkg}..."
+                    self.package_status[pkg] = "Joining..."
                     spec = RobloxLaunchSpec.parse(target.link)
                     
                     ticket = None
@@ -1431,7 +1323,7 @@ done
                     if self.config.health_check_method == "heartbeat":
                         ts, _ = self._read_local_heartbeat(pkg)
                         if ts is not None and (time.time() - ts) > self.config.health_check_timeout_seconds:
-                            self.package_status[pkg] = "Waiting for switched account state to refresh"
+                            self.package_status[pkg] = "Waiting for switch"
                             if self.controller.backend.can_force_stop:
                                 self.controller.force_stop(pkg)
                             time.sleep(1.0)
@@ -1454,14 +1346,13 @@ done
         signal.signal(signal.SIGINT, self.request_stop)
         signal.signal(signal.SIGTERM, self.request_stop)
 
-        # Xóa màn hình trước khi bắt đầu
-        print("\033[2J\033[H", end="")
+        # Xóa sạch màn hình ban đầu
+        sys.stdout.write("\033[2J\033[3J\033[H")
+        sys.stdout.flush()
 
-        # Khởi chạy luồng Worker Rejoin ngầm
         worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
         worker_thread.start()
 
-        # Vòng lặp làm mới Dashboard mỗi 1 giây
         try:
             while not self.stop_requested:
                 self._render_ui()
@@ -1469,7 +1360,7 @@ done
         except KeyboardInterrupt:
             pass
 
-        print(f"\n{Colors.YELLOW}[*] Đang dừng Auto Rejoin Engine...{Colors.RESET}")
+        print(f"\n{Colors.YELLOW}[*] Đang dừng Engine...{Colors.RESET}")
         return 0
 
 
@@ -1558,12 +1449,11 @@ def _menu_login_cookie(
     controller: AndroidController,
     logger: logging.Logger,
 ) -> None:
-    """Mục 5: Đăng nhập Cookie vào từng app và hoàn tất ngay lập tức."""
+    """Mục 5: Đăng nhập Cookie vào từng app và chỉ mở sảnh Roblox (Lobby/Home), không vào game."""
     if not config.targets:
         print(f"\n{Colors.YELLOW}[!] Chưa chọn package nào. Vui lòng vào mục 3 trước.{Colors.RESET}")
         return
 
-    # Tự động tạo cookie.txt nếu chưa có
     cookies = ensure_cookie_file(DEFAULT_COOKIE_SOURCE_PATH)
     if not cookies:
         print(f"\n{Colors.YELLOW}[*] File {DEFAULT_COOKIE_SOURCE_PATH} đã được tự động tạo nhưng đang trống.{Colors.RESET}")
@@ -1590,7 +1480,7 @@ def _menu_login_cookie(
     if not enabled_targets:
         enabled_targets = config.targets
 
-    print(f"\n{Colors.CYAN}[*] Đang thực hiện đăng nhập Cookie cho {len(enabled_targets)} package...{Colors.RESET}")
+    print(f"\n{Colors.CYAN}[*] Đang thực hiện đăng nhập Cookie vào SẢNH cho {len(enabled_targets)} package...{Colors.RESET}")
     for idx, target in enumerate(enabled_targets):
         raw_cookie = cookies[idx % len(cookies)]
         print(f"\n[*] Đang xử lý: {Colors.BOLD}{target.package}{Colors.RESET}")
@@ -1602,38 +1492,34 @@ def _menu_login_cookie(
 
         print(f"{Colors.GREEN}[+] Tài khoản: {user} | Lấy Auth Ticket thành công!{Colors.RESET}")
 
-        # 1. Tiêm SQLite WebView Cookies & SharedPreferences
         if controller.backend.can_write_app_data:
             print(f"{Colors.CYAN}[*] Đang nạp Cookie vào SQLite WebView...{Colors.RESET}")
             inject_direct_root_cookies(controller.backend, target.package, raw_cookie)
 
-        # 2. Force Stop để app áp dụng dữ liệu phiên mới
         if controller.backend.can_force_stop:
             controller.force_stop(target.package)
             time.sleep(0.6)
 
-        # 3. Khởi chạy app vào game / sảnh
-        spec = RobloxLaunchSpec.parse(target.link)
-        launched, detail = controller.start_deep_link(
+        opened, detail = controller.start_lobby(
             target.package,
-            spec,
+            ticket=ticket,
             freeform=config.freeform or config.auto_arrange,
             bounds=target.bounds,
-            ticket=ticket,
         )
 
-        if launched:
-            print(f"{Colors.GREEN}[+] Đã đăng nhập & mở app {target.package} thành công!{Colors.RESET}")
+        if opened:
+            print(f"{Colors.GREEN}[+] Đã đăng nhập & mở Sảnh Roblox {target.package} thành công!{Colors.RESET}")
         else:
-            print(f"{Colors.RED}[-] Lỗi khởi chạy Intent: {_compact(detail)}{Colors.RESET}")
-        time.sleep(1.5)
+            print(f"{Colors.RED}[-] Lỗi khởi chạy: {_compact(detail)}{Colors.RESET}")
+        time.sleep(1.2)
 
-    print(f"\n{Colors.GREEN}{Colors.BOLD}[✓] Hoàn tất quá trình đăng nhập Cookie!{Colors.RESET}")
+    print(f"\n{Colors.GREEN}{Colors.BOLD}[✓] Hoàn tất đăng nhập Cookie vào sảnh Roblox!{Colors.RESET}")
 
 
 def _config_menu(config: RejoinConfig, config_path: Path) -> None:
     while True:
-        print("\033[2J\033[H", end="")
+        sys.stdout.write("\033[2J\033[3J\033[H")
+        sys.stdout.flush()
         print("⚡ SieuVipPro Configuration\n")
         print(f"1. Auto sort tabs (Freeform): {'ON' if config.freeform else 'OFF'}")
         print(f"2. Auto sắp xếp tabs (Grid): {'ON' if config.auto_arrange else 'OFF'}")
@@ -1668,17 +1554,18 @@ def interactive_menu(
     ensure_cookie_file(DEFAULT_COOKIE_SOURCE_PATH)
 
     while True:
-        print("\033[2J\033[H", end="")
-        print(f"{' '*18}⚡ {Colors.CYAN}{Colors.BOLD}SieuVipPro Dashboard{Colors.RESET}\n")
-        print("┌──────┬────────────────────────────────────────────────────────┐")
-        print(f"│ {Colors.MAGENTA}   1{Colors.RESET}  │ {Colors.CYAN}Start Auto Rejoin Engine (Chạy tự động 24/7)           {Colors.RESET}│")
-        print(f"│ {Colors.MAGENTA}   2{Colors.RESET}  │ {Colors.CYAN}Nhập Game ID / Link Server VIP                         {Colors.RESET}│")
-        print(f"│ {Colors.MAGENTA}   3{Colors.RESET}  │ {Colors.CYAN}Chọn Package (1: Lọc tiền tố / 2: Tự quét tất cả)      {Colors.RESET}│")
-        print(f"│ {Colors.MAGENTA}   4{Colors.RESET}  │ {Colors.CYAN}Mở tất cả App lên nền (Warm-up)                        {Colors.RESET}│")
-        print(f"│ {Colors.MAGENTA}   5{Colors.RESET}  │ {Colors.GREEN}Đăng nhập Cookie (Lấy Auth Ticket & Vào Game)          {Colors.RESET}│")
-        print(f"│ {Colors.MAGENTA}  13{Colors.RESET}  │ {Colors.GREEN}Cấu hình Nâng cao (Grid / Heartbeat Watchdog)          {Colors.RESET}│")
-        print(f"│ {Colors.MAGENTA}   0{Colors.RESET}  │ {Colors.RED}Thoát Hệ Thống                                         {Colors.RESET}│")
-        print("└──────┴────────────────────────────────────────────────────────┘")
+        sys.stdout.write("\033[2J\033[3J\033[H")
+        sys.stdout.flush()
+        print(f"{' '*14}⚡ {Colors.CYAN}{Colors.BOLD}SieuVipPro Dashboard{Colors.RESET}\n")
+        print("┌──────┬──────────────────────────────────────────────────┐")
+        print(f"│ {Colors.MAGENTA}   1{Colors.RESET}  │ {Colors.CYAN}Start Auto Rejoin Engine (Chạy tự động 24/7)     {Colors.RESET}│")
+        print(f"│ {Colors.MAGENTA}   2{Colors.RESET}  │ {Colors.CYAN}Nhập Game ID / Link Server VIP                   {Colors.RESET}│")
+        print(f"│ {Colors.MAGENTA}   3{Colors.RESET}  │ {Colors.CYAN}Chọn Package (1: Tiền tố / 2: Tự quét)           {Colors.RESET}│")
+        print(f"│ {Colors.MAGENTA}   4{Colors.RESET}  │ {Colors.CYAN}Mở tất cả App lên nền (Warm-up)                  {Colors.RESET}│")
+        print(f"│ {Colors.MAGENTA}   5{Colors.RESET}  │ {Colors.GREEN}Đăng nhập Cookie vào Sảnh (Không vào Game)       {Colors.RESET}│")
+        print(f"│ {Colors.MAGENTA}  13{Colors.RESET}  │ {Colors.GREEN}Cấu hình Nâng cao (Grid / Heartbeat Watchdog)    {Colors.RESET}│")
+        print(f"│ {Colors.MAGENTA}   0{Colors.RESET}  │ {Colors.RED}Thoát Hệ Thống                                   {Colors.RESET}│")
+        print("└──────┴──────────────────────────────────────────────────┘")
 
         try:
             choice = input(f"\n{Colors.MAGENTA}Execute -> {Colors.RESET}").strip()
