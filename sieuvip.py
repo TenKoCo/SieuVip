@@ -1,10 +1,7 @@
 #!/data/data/com.termux/files/usr/bin/python
 """
 SieuVip Roblox Engine - Root Cookie Auth & Realtime Auto Rejoin System for Android.
-Quy trình chuẩn:
-1. Đóng sạch app mục 3 nếu đang chạy ngầm.
-2. Mở lần lượt từng app lên sảnh rồi đóng lại (Warmup sạch, không sort, không join game).
-3. Rejoin lần lượt từng app vào game kèm chia lưới ô cửa sổ nổi (Grid Freeform) và kích hoạt Watchdog 24/7.
+Tốc độ phản hồi tức thì (Non-blocking), đóng app mục 3 sạch sẽ, Warmup sảnh, và Rejoin kèm chia lưới Grid.
 """
 
 from __future__ import annotations
@@ -46,12 +43,6 @@ DEFAULT_LOCK_PATH = Path("/sdcard/Download/sieuvip_rejoin.lock")
 DEFAULT_BLOX_FRUITS_PLACE_ID = "2753915549"
 PACKAGE_RE = re.compile(r"^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+$")
 USER_AGENT = "Roblox/Android (Android 10; Mobile; Build/10.0)"
-
-SYSTEM_PATH = (
-    "/product/bin:/apex/com.android.runtime/bin:/apex/com.android.art/bin:"
-    "/system_ext/bin:/system/bin:/system/xbin:/odm/bin:/vendor/bin:/vendor/xbin:"
-    "/data/data/com.termux/files/usr/bin"
-)
 
 SSL_CONTEXT = ssl.create_default_context()
 SSL_CONTEXT.check_hostname = False
@@ -314,7 +305,7 @@ class RobloxAuthSystem:
                     "Accept": "application/json",
                 },
             )
-            with urllib.request.urlopen(req_user, timeout=8, context=SSL_CONTEXT) as resp:
+            with urllib.request.urlopen(req_user, timeout=6, context=SSL_CONTEXT) as resp:
                 user_data = json.loads(resp.read().decode("utf-8", errors="replace"))
                 username = user_data.get("name")
         except Exception:
@@ -339,7 +330,7 @@ class RobloxAuthSystem:
             )
             csrf_token = None
             try:
-                with urllib.request.urlopen(req_csrf, timeout=8, context=SSL_CONTEXT) as resp:
+                with urllib.request.urlopen(req_csrf, timeout=6, context=SSL_CONTEXT) as resp:
                     csrf_token = resp.headers.get("x-csrf-token")
             except urllib.error.HTTPError as err:
                 csrf_token = err.headers.get("x-csrf-token")
@@ -365,7 +356,7 @@ class RobloxAuthSystem:
                 },
                 method="POST",
             )
-            with urllib.request.urlopen(req_ticket, timeout=8, context=SSL_CONTEXT) as resp:
+            with urllib.request.urlopen(req_ticket, timeout=6, context=SSL_CONTEXT) as resp:
                 ticket = resp.headers.get("rbx-authentication-ticket")
                 if ticket:
                     return True, username, ticket.strip(), "Cấp Ticket thành công"
@@ -385,25 +376,28 @@ class RobloxAuthSystem:
 class RootController:
     """Thực thi các lệnh Android qua Root sạch sẽ, tương thích 100% UgPhone."""
 
-    @staticmethod
-    def _clean_env() -> Dict[str, str]:
-        env = os.environ.copy()
-        env.pop("LD_PRELOAD", None)
-        env.pop("LD_LIBRARY_PATH", None)
-        env["PATH"] = SYSTEM_PATH
-        return env
+    PROTECTED_PACKAGES = {
+        "com.termux",
+        "com.termux.boot",
+        "com.termux.api",
+        "com.termux.styling",
+        "com.termux.gui",
+        "android",
+        "com.android.systemui",
+        "com.android.settings",
+        "com.android.launcher",
+        "com.google.android.inputmethod.latin",
+        "com.google.android.gms",
+    }
 
     @classmethod
     def run(cls, cmd: str, timeout: float = 10.0) -> Tuple[bool, str]:
-        env = cls._clean_env()
         try:
-            su_bin = shutil.which("su") or "/system/bin/su" or "/system/xbin/su" or "/sbin/su"
             res = subprocess.run(
-                [su_bin, "-c", cmd],
+                ["su", "-c", cmd],
                 capture_output=True,
                 text=True,
                 timeout=timeout,
-                env=env,
                 check=False
             )
             out = (res.stdout + "\n" + res.stderr).strip()
@@ -424,20 +418,6 @@ class RootController:
     def is_running(cls, package: str) -> bool:
         ok, out = cls.run(f"pidof {package}")
         return ok and bool(out.strip())
-
-    PROTECTED_PACKAGES = {
-        "com.termux",
-        "com.termux.boot",
-        "com.termux.api",
-        "com.termux.styling",
-        "com.termux.gui",
-        "android",
-        "com.android.systemui",
-        "com.android.settings",
-        "com.android.launcher",
-        "com.google.android.inputmethod.latin",
-        "com.google.android.gms",
-    }
 
     @classmethod
     def force_stop(cls, package: str) -> bool:
@@ -523,7 +503,7 @@ fi
         freeform: bool = True,
         bounds: Optional[str] = None,
     ) -> bool:
-        """Khởi chạy ứng dụng Roblox với Deep Link và xếp cửa sổ Freeform Bounds."""
+        """Khởi chạy ứng dụng Roblox với Deep Link và xếp cửa sổ Freeform Bounds (Non-blocking)."""
         raw = link_or_id.strip()
         params: Dict[str, str] = {}
         if raw.isdigit():
@@ -550,40 +530,22 @@ fi
         elif freeform:
             opt = "--windowingMode 5"
 
-        # 1. Thử Deep link chuẩn với Windowing Mode
-        cmd1 = f"am start -W {opt} -a android.intent.action.VIEW -d '{deep_link}' -p {package}"
+        # 1. Khởi chạy Deep Link trực tiếp
+        cmd1 = f"am start {opt} -a android.intent.action.VIEW -d '{deep_link}' -p {package}"
         ok1, out1 = cls.run(cmd1)
-        if ok1 and "error" not in out1.lower():
+        if ok1 and "error" not in out1.lower() and "unable to resolve" not in out1.lower():
             if freeform and bounds:
                 time.sleep(0.3)
                 cls.apply_task_bounds(package, bounds)
             return True
 
-        # 2. Thử Deep link không có opt
-        cmd2 = f"am start -W -a android.intent.action.VIEW -d '{deep_link}' -p {package}"
-        ok2, out2 = cls.run(cmd2)
-        if ok2 and "error" not in out2.lower():
-            if freeform and bounds:
-                time.sleep(0.4)
-                cls.apply_task_bounds(package, bounds)
-            return True
-
-        # 3. Fallback mở Launcher
-        cmd3 = f"am start -W {opt} -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p {package}"
-        ok3, out3 = cls.run(cmd3)
-        if ok3 and "error" not in out3.lower():
-            if freeform and bounds:
-                time.sleep(0.4)
-                cls.apply_task_bounds(package, bounds)
-            return True
-
-        # 4. Fallback Launcher chuẩn
-        cmd4 = f"am start -W -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p {package}"
-        ok4, _ = cls.run(cmd4)
+        # 2. Fallback mở Launcher nếu Deep Link không nhận
+        cmd2 = f"am start {opt} -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p {package}"
+        ok2, _ = cls.run(cmd2)
         if freeform and bounds:
-            time.sleep(0.4)
+            time.sleep(0.3)
             cls.apply_task_bounds(package, bounds)
-        return ok4
+        return ok2
 
     @classmethod
     def launch_lobby_only(
@@ -601,12 +563,12 @@ fi
             opt = "--windowingMode 5"
 
         if ticket:
-            cmd = f"am start -W {opt} -a android.intent.action.VIEW -d 'roblox://navigation/home?ticket={urllib.parse.quote(ticket)}' -p {package}"
+            cmd = f"am start {opt} -a android.intent.action.VIEW -d 'roblox://navigation/home?ticket={urllib.parse.quote(ticket)}' -p {package}"
             ok, out = cls.run(cmd)
             if ok and "error" not in out.lower():
                 return True
 
-        cmd = f"am start -W {opt} -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p {package}"
+        cmd = f"am start {opt} -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p {package}"
         ok, _ = cls.run(cmd)
         return ok
 
@@ -809,7 +771,7 @@ done
             if RootController.is_running(pkg):
                 self.package_status[pkg] = "Closing..."
                 RootController.force_stop(pkg)
-                time.sleep(0.4)
+                time.sleep(0.3)
 
         # BƯỚC 1: MỞ LẦN LƯỢT TỪNG APP LÊN SẢNH RỒI ĐÓNG LẠI
         for target in enabled:
@@ -823,7 +785,7 @@ done
             # Đóng app vừa warmup
             self.package_status[pkg] = "Closing..."
             RootController.force_stop(pkg)
-            time.sleep(0.8)
+            time.sleep(0.6)
             self.package_status[pkg] = "Waiting..."
 
     def _worker_loop(self) -> None:
@@ -867,7 +829,7 @@ done
 
                     RootController.run("rm -f /sdcard/Delta/workspace/sv_heartbeat.main /sdcard/Download/sv_heartbeat.main 2>/dev/null")
 
-                    # Khởi chạy vào Game và xếp cửa sổ theo Grid Bounds
+                    # Khởi chạy vào Game và xếp cửa sổ theo Grid Bounds (Tức thì)
                     RootController.launch(
                         pkg,
                         target.link,
@@ -877,7 +839,7 @@ done
                     )
 
                     self._launch_timestamps[pkg] = time.monotonic()
-                    time.sleep(2.5)
+                    time.sleep(2.0)
                     continue
 
                 # TRƯỜNG HỢP 2: APP ĐANG CHẠY -> GIÁM SÁT SỨC KHỎE WATCHDOG
@@ -974,6 +936,7 @@ def menu_choose_packages(config: RejoinConfig, path: Path) -> None:
                 selected = [user_apps[int(choice) - 1]]
             elif PACKAGE_RE.fullmatch(choice):
                 selected = [choice]
+
     # Lọc bỏ hoàn toàn Termux và các package hệ thống
     selected = [
         p for p in selected
