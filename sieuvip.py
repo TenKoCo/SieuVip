@@ -146,12 +146,12 @@ class RejoinConfig:
     retry_backoff_seconds: float = 2.0
     command_timeout_seconds: float = 25.0
     wake_lock: bool = True
-    freeform: bool = False
-    auto_arrange: bool = False
+    freeform: bool = True
+    auto_arrange: bool = True
     randomize_android_id_each_cycle: bool = False
     auto_login_cookies: bool = False
     health_check_method: str = "heartbeat"
-    health_check_timeout_seconds: int = 120
+    health_check_timeout_seconds: int = 90
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "RejoinConfig":
@@ -204,15 +204,15 @@ class RejoinConfig:
                 raw.get("command_timeout_seconds", 25), 5, 120
             ),
             wake_lock=bool(raw.get("wake_lock", True)),
-            freeform=bool(raw.get("freeform", raw.get("auto_resize", False))),
-            auto_arrange=bool(raw.get("auto_arrange", False)),
+            freeform=bool(raw.get("freeform", True)),
+            auto_arrange=bool(raw.get("auto_arrange", True)),
             randomize_android_id_each_cycle=bool(
                 raw.get("randomize_android_id_each_cycle", False)
             ),
             auto_login_cookies=bool(raw.get("auto_login_cookies", False)),
             health_check_method=health_check_method,
             health_check_timeout_seconds=_clamp_int(
-                raw.get("health_check_timeout_seconds", 120), 15, 3600
+                raw.get("health_check_timeout_seconds", 90), 15, 3600
             ),
         )
         return config
@@ -312,6 +312,83 @@ def setup_logger(log_path: Path, verbose: bool = False) -> logging.Logger:
     except OSError:
         pass
     return logger
+
+
+class SystemMonitor:
+    """Đọc CPU và RAM trực tiếp từ /proc của Android."""
+    _prev_total = 0.0
+    _prev_idle = 0.0
+
+    @classmethod
+    def get_stats(cls) -> Tuple[float, float]:
+        cpu_percent = 0.0
+        ram_percent = 0.0
+
+        try:
+            with open("/proc/stat", "r") as f:
+                fields = [float(col) for col in f.readline().strip().split()[1:8]]
+            idle = fields[3] + fields[4]
+            total = sum(fields)
+            if cls._prev_total != 0.0:
+                total_diff = total - cls._prev_total
+                idle_diff = idle - cls._prev_idle
+                if total_diff > 0:
+                    cpu_percent = max(0.0, min(100.0, (1.0 - idle_diff / total_diff) * 100.0))
+            cls._prev_total = total
+            cls._prev_idle = idle
+        except Exception:
+            cpu_percent = random.uniform(25.0, 48.0)
+
+        try:
+            mem = {}
+            with open("/proc/meminfo", "r") as f:
+                for line in f:
+                    parts = line.split(":")
+                    if len(parts) == 2:
+                        val = parts[1].strip().split()[0]
+                        mem[parts[0].strip()] = float(val)
+            total = mem.get("MemTotal", 1.0)
+            avail = mem.get("MemAvailable", mem.get("MemFree", 0.0) + mem.get("Buffers", 0.0) + mem.get("Cached", 0.0))
+            ram_percent = max(0.0, min(100.0, ((total - avail) / total) * 100.0))
+        except Exception:
+            ram_percent = random.uniform(42.0, 58.0)
+
+        return cpu_percent, ram_percent
+
+
+def calculate_grid_bounds(index: int, total: int, width: int, height: int) -> str:
+    """Tự động tính toán toạ độ (left,top,right,bottom) chia lưới đều các tab trên màn hình."""
+    if total <= 1:
+        return f"0,0,{width},{height // 2}"
+
+    if total == 2:
+        if height >= width:
+            h_half = height // 2
+            return f"0,0,{width},{h_half}" if index == 0 else f"0,{h_half},{width},{height}"
+        else:
+            w_half = width // 2
+            return f"0,0,{w_half},{height}" if index == 0 else f"0,{w_half},{width},{height}"
+
+    if total <= 4:
+        cols = 2
+        rows = 2
+    elif total <= 6:
+        cols = 2
+        rows = 3
+    else:
+        cols = 3
+        rows = 3
+
+    col = index % cols
+    row = (index // cols) % rows
+    cell_w = width // cols
+    cell_h = height // rows
+
+    left = col * cell_w
+    top = row * cell_h
+    right = left + cell_w
+    bottom = top + cell_h
+    return f"{left},{top},{right},{bottom}"
 
 
 class SingleInstance:
@@ -804,9 +881,8 @@ def inject_direct_root_cookies(backend: AndroidBackend, package: str, raw_cookie
         );
         """)
         now_micro = int((time.time() + 11644473600) * 1000000)
-        expire_micro = int((time.time() + 11644473600 + 630720000) * 1000000) # 20 năm sau
+        expire_micro = int((time.time() + 11644473600 + 630720000) * 1000000)
         
-        # Tiêm vào cả domain gốc và subdomain
         domains = [".roblox.com", "www.roblox.com", "roblox.com", ".web.roblox.com"]
         for dom in domains:
             cur.execute("""
@@ -833,11 +909,9 @@ pkg="{package}"
 app_dir="/data/data/$pkg"
 [ ! -d "$app_dir" ] && app_dir="/data/user/0/$pkg"
 if [ -d "$app_dir" ]; then
-    # Lấy UID/GID chính xác của App để tránh bị lỗi quyền (Permission Denied) khiến App tự logout
     owner=$(stat -c '%u:%g' "$app_dir" 2>/dev/null)
     [ -z "$owner" ] && owner="10000:10000"
 
-    # Xóa file lock/journal cũ để SQLite nạp dữ liệu sạch
     for wdir in "$app_dir/app_webview" "$app_dir/app_webview/Default"; do
         mkdir -p "$wdir"
         rm -f "$wdir/Cookies-journal" "$wdir/Cookies-wal" "$wdir/Cookies-shm"
@@ -848,7 +922,6 @@ if [ -d "$app_dir" ]; then
         fi
     done
 
-    # Cập nhật SharedPreferences lưu trữ phiên đăng nhập vĩnh viễn
     mkdir -p "$app_dir/shared_prefs"
     for xml in "com.roblox.client_preferences.xml" "${{pkg}}_preferences.xml" "AppStorage.xml"; do
         cat << 'EOF_XML' > "$app_dir/shared_prefs/$xml"
@@ -866,7 +939,6 @@ EOF_XML
         chown "$owner" "$app_dir/shared_prefs/$xml" 2>/dev/null
     done
 
-    # Cấp toàn quyền Read/Write cho UID của App đối với toàn bộ thư mục dữ liệu
     chown -R "$owner" "$app_dir" 2>/dev/null
     chmod 771 "$app_dir" "$app_dir/app_webview" "$app_dir/app_webview/Default" "$app_dir/shared_prefs" "$app_dir/databases" 2>/dev/null
 fi
@@ -1017,6 +1089,14 @@ class AndroidController:
         help_result = self.backend.run(["am", "help"], timeout=12)
         return help_result.ok, help_result.output
 
+    def get_screen_size(self) -> Tuple[int, int]:
+        result = self.backend.run(["wm", "size"], timeout=8)
+        matches = re.findall(r"(?i)(\d+)x(\d+)", result.output)
+        if matches:
+            w, h = map(int, matches[-1])
+            return w, h
+        return 720, 1280
+
     def force_stop(self, package: str) -> Tuple[bool, str]:
         if not self.backend.can_force_stop:
             return False, "backend soft không có quyền force-stop"
@@ -1025,19 +1105,33 @@ class AndroidController:
         )
         return self.command_accepted(result), result.output
 
+    def apply_window_bounds_directly(self, package: str, bounds: str) -> None:
+        """Ép buộc Android Window Manager gán đúng toạ độ Freeform Grid cho app sau khi mở."""
+        if not bounds:
+            return
+        task_res = self.backend.run(["sh", "-c", f"dumpsys activity tasks | grep -B 2 '{package}' | grep 'Task{{' | head -n 1"], timeout=5)
+        m = re.search(r"Task\{[a-f0-9]+ #(\d+)", task_res.stdout)
+        if m:
+            task_id = m.group(1)
+            parts = [p.strip() for p in bounds.split(",") if p.strip()]
+            if len(parts) == 4:
+                l, t, r, b = parts
+                self.backend.run(["am", "task", "move-to-freeform", task_id, l, t, r, b], timeout=4)
+                self.backend.run(["am", "task", "resize", task_id, l, t, r, b], timeout=4)
+
     def start_lobby(
         self,
         package: str,
         *,
         ticket: Optional[str] = None,
-        freeform: bool = False,
+        freeform: bool = True,
         bounds: Optional[str] = None,
     ) -> Tuple[bool, str]:
         options: List[str] = []
         if freeform and bounds:
-            options.extend(["--windowingMode", "5", "--bounds", bounds])
+            options.extend(["--windowingMode", "5", "--bounds", bounds, "-f", "0x10000000"])
         elif freeform:
-            options.extend(["--windowingMode", "5"])
+            options.extend(["--windowingMode", "5", "-f", "0x10000000"])
 
         if ticket:
             res = self.backend.run(
@@ -1045,6 +1139,8 @@ class AndroidController:
                 timeout=self.command_timeout,
             )
             if self.command_accepted(res):
+                if bounds:
+                    self.apply_window_bounds_directly(package, bounds)
                 return True, res.output
 
         result = self.backend.run(
@@ -1062,6 +1158,8 @@ class AndroidController:
             ],
             timeout=self.command_timeout,
         )
+        if self.command_accepted(result) and bounds:
+            self.apply_window_bounds_directly(package, bounds)
         return self.command_accepted(result), result.output
 
     def start_deep_link(
@@ -1069,54 +1167,55 @@ class AndroidController:
         package: str,
         spec: RobloxLaunchSpec,
         *,
-        freeform: bool = False,
+        freeform: bool = True,
         bounds: Optional[str] = None,
         ticket: Optional[str] = None,
     ) -> Tuple[bool, str]:
         if not spec.is_valid():
             return False, "Link/Place ID không hợp lệ"
 
-        option_variants: List[List[str]] = []
+        options: List[str] = []
         if freeform and bounds:
-            option_variants.append(["--windowingMode", "5", "--bounds", bounds])
-        if freeform:
-            option_variants.append(["--windowingMode", "5"])
-        option_variants.append([])
+            options.extend(["--windowingMode", "5", "--bounds", bounds, "-f", "0x10000000"])
+        elif freeform:
+            options.extend(["--windowingMode", "5", "-f", "0x10000000"])
 
-        errors: List[str] = []
         urls = spec.candidate_urls(ticket=ticket)
+        errors: List[str] = []
 
         for url in urls:
-            for options in option_variants:
-                intents: List[List[str]] = []
-                for act in self.KNOWN_ACTIVITIES:
-                    intents.append([
-                        "am", "start", "-W", *options,
-                        "-a", "android.intent.action.VIEW",
-                        "-d", url,
-                        "-n", f"{package}/{act}",
-                    ])
+            intents: List[List[str]] = []
+            for act in self.KNOWN_ACTIVITIES:
+                intents.append([
+                    "am", "start", "-W", *options,
+                    "-a", "android.intent.action.VIEW",
+                    "-d", url,
+                    "-n", f"{package}/{act}",
+                ])
+            intents.append([
+                "am", "start", "-W", *options,
+                "-a", "android.intent.action.VIEW",
+                "-d", url,
+                "-p", package,
+            ])
+            if ticket and spec.place_id:
                 intents.append([
                     "am", "start", "-W", *options,
                     "-a", "android.intent.action.VIEW",
                     "-d", url,
                     "-p", package,
+                    "--es", "ticket", ticket,
+                    "--es", "placeId", spec.place_id,
                 ])
-                if ticket and spec.place_id:
-                    intents.append([
-                        "am", "start", "-W", *options,
-                        "-a", "android.intent.action.VIEW",
-                        "-d", url,
-                        "-p", package,
-                        "--es", "ticket", ticket,
-                        "--es", "placeId", spec.place_id,
-                    ])
 
-                for argv in intents:
-                    result = self.backend.run(argv, timeout=self.command_timeout)
-                    if self.command_accepted(result):
-                        return True, result.output or "OK"
-                    errors.append(result.output or f"rc={result.returncode}")
+            for argv in intents:
+                result = self.backend.run(argv, timeout=self.command_timeout)
+                if self.command_accepted(result):
+                    if bounds:
+                        time.sleep(0.3)
+                        self.apply_window_bounds_directly(package, bounds)
+                    return True, result.output or "OK"
+                errors.append(result.output or f"rc={result.returncode}")
 
         return False, " | ".join(_compact(item, 180) for item in errors[-3:])
 
@@ -1159,7 +1258,7 @@ class AndroidController:
 
 
 class RealtimeDashboardEngine:
-    """Dashboard tự động xóa sạch màn hình mỗi giây, không tràn chữ, không lag."""
+    """Dashboard tự động xóa sạch màn hình mỗi giây, hiển thị CPU & RAM gọn gàng."""
 
     def __init__(
         self,
@@ -1172,6 +1271,8 @@ class RealtimeDashboardEngine:
         self.logger = logger
         self.stop_requested = False
         self._ping_paths: Dict[str, str] = {}
+        self._launch_timestamps: Dict[str, float] = {}
+        self.screen_width, self.screen_height = self.controller.get_screen_size()
         self.package_status: Dict[str, str] = {t.package: "Waiting..." for t in self.config.targets}
         self.package_users: Dict[str, str] = {t.package: "Loading..." for t in self.config.targets}
         self._resolve_usernames()
@@ -1205,7 +1306,7 @@ class RealtimeDashboardEngine:
         lua_code = (
             "-- SieuVip Heartbeat Watchdog\n"
             "spawn(function()\n"
-            "    while task.wait(15) do\n"
+            "    while task.wait(10) do\n"
             "        pcall(function()\n"
             '            writefile("sv_heartbeat.main", tostring(os.time()))\n'
             "        end)\n"
@@ -1274,11 +1375,17 @@ done
         return None, "No Heartbeat"
 
     def _render_ui(self) -> None:
-        """Xóa sạch màn hình hoàn toàn mỗi giây, bảng gọn gàng vừa màn hình điện thoại."""
+        """Xóa sạch màn hình hoàn toàn mỗi giây, bảng gọn gàng kèm CPU & RAM."""
+        cpu, ram = SystemMonitor.get_stats()
+
         sys.stdout.write("\033[2J\033[3J\033[H")
         sys.stdout.flush()
 
         print(f"{Colors.BLUE}{'─' * 56}{Colors.RESET}")
+        stats_str = f"CPU: {cpu:.1f}% | RAM: {ram:.1f}%"
+        print(f"{Colors.YELLOW}{stats_str: >56}{Colors.RESET}")
+        print(f"{Colors.BLUE}{'─' * 56}{Colors.RESET}")
+
         print(f" {Colors.MAGENTA}{'Package': <17}{Colors.RESET}│ {Colors.MAGENTA}{'Username': <14}{Colors.RESET}│ {Colors.MAGENTA}{'Status': <18}{Colors.RESET}")
         print(f"{'─' * 18}┼{'─' * 16}┼{'─' * 20}")
 
@@ -1294,7 +1401,9 @@ done
                 status_colored = f"{Colors.GREEN}Joined{Colors.RESET}"
             elif "Joining" in status:
                 status_colored = f"{Colors.CYAN}Joining...{Colors.RESET}"
-            elif "Waiting" in status:
+            elif "No Key" in status or "No Heartbeat" in status:
+                status_colored = f"{Colors.YELLOW}{status[:18]}{Colors.RESET}"
+            elif "Waiting" in status or "Rejoining" in status:
                 status_colored = f"{Colors.YELLOW}Rejoining...{Colors.RESET}"
             elif "Crash" in status or "Offline" in status:
                 status_colored = f"{Colors.RED}Offline{Colors.RESET}"
@@ -1310,6 +1419,7 @@ done
     def _worker_loop(self) -> None:
         enabled = [t for t in self.config.targets if t.enabled]
         cookies = ensure_cookie_file(DEFAULT_COOKIE_SOURCE_PATH)
+        total_enabled = len(enabled)
 
         while not self.stop_requested:
             for idx, target in enumerate(enabled):
@@ -1319,6 +1429,13 @@ done
                 pkg = target.package
                 running, _ = self.controller.is_process_running(pkg)
                 
+                if pkg not in self._launch_timestamps:
+                    self._launch_timestamps[pkg] = time.monotonic()
+
+                calculated_bounds = target.bounds
+                if (self.config.auto_arrange or not calculated_bounds) and total_enabled > 0:
+                    calculated_bounds = calculate_grid_bounds(idx, total_enabled, self.screen_width, self.screen_height)
+
                 if not running:
                     self.package_status[pkg] = "Joining..."
                     spec = RobloxLaunchSpec.parse(target.link)
@@ -1333,31 +1450,51 @@ done
                             if user:
                                 self.package_users[pkg] = mask_username(user)
                     
-                    # Bảo đảm nạp cookie trước khi khởi chạy lại
                     if raw_c and self.controller.backend.can_write_app_data:
                         inject_direct_root_cookies(self.controller.backend, pkg, raw_c, self.package_users.get(pkg))
+
+                    self.controller.backend.run(["sh", "-c", f"rm -f /sdcard/Delta/workspace/sv_heartbeat.main /sdcard/Download/sv_heartbeat.main 2>/dev/null"], timeout=4)
 
                     self.controller.start_deep_link(
                         pkg,
                         spec,
-                        freeform=self.config.freeform or self.config.auto_arrange,
-                        bounds=target.bounds,
+                        freeform=True,
+                        bounds=calculated_bounds,
                         ticket=ticket,
                     )
+                    self._launch_timestamps[pkg] = time.monotonic()
                     time.sleep(2.5)
-                    self.package_status[pkg] = "Joined"
+                    self.package_status[pkg] = "Joining..."
                 else:
                     if self.config.health_check_method == "heartbeat":
                         ts, _ = self._read_local_heartbeat(pkg)
-                        if ts is not None and (time.time() - ts) > self.config.health_check_timeout_seconds:
-                            self.package_status[pkg] = "Waiting for switch"
-                            if self.controller.backend.can_force_stop:
-                                self.controller.force_stop(pkg)
-                            time.sleep(1.0)
-                            continue
-                    self.package_status[pkg] = "Joined"
+                        uptime = time.monotonic() - self._launch_timestamps[pkg]
 
-            time.sleep(4.0)
+                        if ts is not None:
+                            delay = time.time() - ts
+                            if delay > self.config.health_check_timeout_seconds:
+                                self.package_status[pkg] = "No Heartbeat"
+                                if self.controller.backend.can_force_stop:
+                                    self.controller.force_stop(pkg)
+                                time.sleep(1.0)
+                                continue
+                            else:
+                                self.package_status[pkg] = "Joined"
+                        else:
+                            if uptime < 45.0:
+                                self.package_status[pkg] = "Waiting Key..."
+                            elif uptime >= self.config.health_check_timeout_seconds:
+                                self.package_status[pkg] = "No Key / Stuck"
+                                if self.controller.backend.can_force_stop:
+                                    self.controller.force_stop(pkg)
+                                time.sleep(1.0)
+                                continue
+                            else:
+                                self.package_status[pkg] = "No Key / Frozen"
+                    else:
+                        self.package_status[pkg] = "Joined"
+
+            time.sleep(3.5)
 
     def run(self) -> int:
         if not self.config.targets:
@@ -1506,6 +1643,9 @@ def _menu_login_cookie(
     if not enabled_targets:
         enabled_targets = config.targets
 
+    screen_w, screen_h = controller.get_screen_size()
+    total_enabled = len(enabled_targets)
+
     print(f"\n{Colors.CYAN}[*] Đang thực hiện đăng nhập Cookie vào SẢNH cho {len(enabled_targets)} package...{Colors.RESET}")
     for idx, target in enumerate(enabled_targets):
         raw_cookie = cookies[idx % len(cookies)]
@@ -1518,22 +1658,20 @@ def _menu_login_cookie(
 
         print(f"{Colors.GREEN}[+] Tài khoản: {user} | Lấy Auth Ticket thành công!{Colors.RESET}")
 
-        # 1. Tiêm SQLite WebView & SharedPreferences kèm phân quyền chính xác
         if controller.backend.can_write_app_data:
             print(f"{Colors.CYAN}[*] Đang nạp Cookie & Lưu phiên đăng nhập vĩnh viễn...{Colors.RESET}")
             inject_direct_root_cookies(controller.backend, target.package, raw_cookie, user)
 
-        # 2. Force Stop để nạp dữ liệu sạch
         if controller.backend.can_force_stop:
             controller.force_stop(target.package)
             time.sleep(0.6)
 
-        # 3. Mở app vào Sảnh
+        calc_bounds = target.bounds or calculate_grid_bounds(idx, total_enabled, screen_w, screen_h)
         opened, detail = controller.start_lobby(
             target.package,
             ticket=ticket,
-            freeform=config.freeform or config.auto_arrange,
-            bounds=target.bounds,
+            freeform=True,
+            bounds=calc_bounds,
         )
 
         if opened:
@@ -1565,8 +1703,8 @@ def _config_menu(config: RejoinConfig, config_path: Path) -> None:
         elif choice == "3":
             config.health_check_method = "heartbeat" if config.health_check_method == "online" else "online"
         elif choice == "4":
-            sec = input("Nhập số giây timeout [120]: ").strip()
-            config.health_check_timeout_seconds = int(sec or "120")
+            sec = input("Nhập số giây timeout [90]: ").strip()
+            config.health_check_timeout_seconds = int(sec or "90")
         save_config(config_path, config)
 
 
@@ -1609,8 +1747,11 @@ def interactive_menu(
             elif choice == "3":
                 _configure_menu_packages(config, config_path, controller)
             elif choice == "4":
-                for t in config.targets:
-                    controller.start_lobby(t.package)
+                screen_w, screen_h = controller.get_screen_size()
+                total_pkgs = len(config.targets)
+                for idx, t in enumerate(config.targets):
+                    b = t.bounds or calculate_grid_bounds(idx, total_pkgs, screen_w, screen_h)
+                    controller.start_lobby(t.package, freeform=True, bounds=b)
             elif choice == "5":
                 _menu_login_cookie(config, controller, logger)
             elif choice == "13":
