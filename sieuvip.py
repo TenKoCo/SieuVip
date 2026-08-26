@@ -1,7 +1,7 @@
 #!/data/data/com.termux/files/usr/bin/python
 """
 SieuVip Roblox Engine - Root Cookie Auth & Realtime Auto Rejoin System for Android.
-Tối ưu hóa tốc độ cao, khởi chạy tức thì, tự động chia lưới (Grid Freeform) và Watchdog.
+Quy trình chuẩn: Khởi động dọn dẹp app -> Đóng sạch sẽ -> Rejoin từng app vào game kèm chia lưới (Grid Freeform).
 """
 
 from __future__ import annotations
@@ -163,7 +163,7 @@ def save_config(path: Path, config: RejoinConfig) -> None:
         print(f"Lỗi lưu config: {e}")
 
 
-def setup_logger(log_path: Path, verbose: bool = False) -> logging.Logger:
+def setup_logger(log_path: Path) -> logging.Logger:
     try:
         log_path.parent.mkdir(parents=True, exist_ok=True)
     except OSError:
@@ -268,7 +268,7 @@ def calculate_grid_bounds(index: int, total: int, width: int, height: int) -> st
 
 
 class RobloxAuthSystem:
-    """Xử lý xác thực Cookie và tạo Auth Ticket qua cURL/urllib chuẩn xác."""
+    """Xử lý xác thực Cookie và tạo Auth Ticket qua API Roblox."""
 
     @staticmethod
     def clean_cookie(raw: str) -> str:
@@ -298,11 +298,6 @@ class RobloxAuthSystem:
         token = cls.clean_cookie(raw_cookie)
         if len(token) < 50:
             return False, None, None, "Cookie quá ngắn hoặc không hợp lệ"
-
-        full_token = (
-            f"_|WARNING:-DO-NOT-SHARE-THIS.--Sharing-this-will-allow-someone-to-log-into-your-account-and-rob-your-robox.--|_{token}"
-            if "_|WARNING:" not in token else token
-        )
 
         # 1. Lấy Username
         try:
@@ -506,19 +501,16 @@ fi
         elif freeform:
             opt = "--windowingMode 5"
 
-        # 1. Khởi chạy Deep Link trực tiếp
         cmd = f"am start -W {opt} -a android.intent.action.VIEW -d '{deep_link}' -p {package}"
         ok, out = cls.run(cmd)
         if ok and "error" not in out.lower():
             return True
 
-        # 2. Fallback sang Deep Link roblox://placeId=...
         cmd_fallback = f"am start -W {opt} -a android.intent.action.VIEW -d 'roblox://{urllib.parse.urlencode(params)}' -p {package}"
         ok2, out2 = cls.run(cmd_fallback)
         if ok2 and "error" not in out2.lower():
             return True
 
-        # 3. Fallback mở Sảnh Roblox
         cmd_lobby = f"am start -W {opt} -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p {package}"
         ok3, _ = cls.run(cmd_lobby)
         return ok3
@@ -528,10 +520,10 @@ fi
         cls,
         package: str,
         ticket: Optional[str] = None,
-        freeform: bool = True,
+        freeform: bool = False,
         bounds: Optional[str] = None,
     ) -> bool:
-        """Chỉ mở Sảnh Roblox (Lobby/Home)."""
+        """Chỉ mở Sảnh Roblox (Lobby/Home) thuần túy."""
         opt = ""
         if freeform and bounds:
             opt = f"--windowingMode 5 --bounds {bounds}"
@@ -579,7 +571,7 @@ def mask_username(username: Optional[str]) -> str:
 
 
 class RealtimeDashboardEngine:
-    """Engine giám sát thời gian thực: Tự động khởi động lại ngay khi tắt app, sắp xếp lưới cửa sổ."""
+    """Engine giám sát thời gian thực: Khởi động dọn dẹp -> Rejoin vào game kèm chia lưới."""
 
     def __init__(self, config: RejoinConfig, logger: logging.Logger) -> None:
         self.config = config
@@ -715,6 +707,10 @@ done
                 status_colored = f"{Colors.GREEN}Joined{Colors.RESET}"
             elif "Joining" in status:
                 status_colored = f"{Colors.CYAN}Joining...{Colors.RESET}"
+            elif "Warmup" in status or "Opening" in status:
+                status_colored = f"{Colors.CYAN}Warmup...{Colors.RESET}"
+            elif "Closing" in status:
+                status_colored = f"{Colors.YELLOW}Closing...{Colors.RESET}"
             elif "No Key" in status or "No Heartbeat" in status:
                 status_colored = f"{Colors.YELLOW}{status[:18]}{Colors.RESET}"
             elif "Waiting" in status or "Rejoining" in status:
@@ -730,11 +726,32 @@ done
         print(f"{Colors.GRAY}Nhấn Ctrl+C để dừng và quay lại Menu.{Colors.RESET}")
         sys.stdout.flush()
 
+    def _warmup_and_reset_apps(self, enabled: List[TargetConfig]) -> None:
+        """Giai đoạn 1: Mở lần lượt từng app (không join game, không sort) rồi đóng lại sạch sẽ."""
+        for target in enabled:
+            if self.stop_requested:
+                break
+            pkg = target.package
+            self.package_status[pkg] = "Warmup..."
+            # Mở app thuần túy lên sảnh, không chia cửa sổ
+            RootController.launch_lobby_only(pkg, freeform=False, bounds=None)
+            time.sleep(2.0)
+            
+            # Đóng app ngay lập tức
+            self.package_status[pkg] = "Closing..."
+            RootController.force_stop(pkg)
+            time.sleep(0.6)
+            self.package_status[pkg] = "Waiting..."
+
     def _worker_loop(self) -> None:
         enabled = [t for t in self.config.targets if t.enabled]
         cookies = load_cookie_list(DEFAULT_COOKIE_SOURCE_PATH)
         total_enabled = len(enabled)
 
+        # GIAI ĐOẠN 1: MỞ LẦN LƯỢT TỪNG APP RỒI ĐÓNG LẠI SẠCH SẼ (KHÔNG JOIN GAME, KHÔNG SORT)
+        self._warmup_and_reset_apps(enabled)
+
+        # GIAI ĐOẠN 2: REJOIN TỪNG APP VÀO GAME KÈM SORT / CHIA LƯỚI
         while not self.stop_requested:
             for idx, target in enumerate(enabled):
                 if self.stop_requested:
@@ -743,12 +760,12 @@ done
                 pkg = target.package
                 is_alive = RootController.is_running(pkg)
 
-                # Tính toạ độ chia lưới Grid
+                # Tính toạ độ chia lưới Grid nếu bật sort/freeform
                 calculated_bounds = target.bounds
                 if (self.config.auto_arrange or not calculated_bounds) and total_enabled > 0:
                     calculated_bounds = calculate_grid_bounds(idx, total_enabled, self.screen_width, self.screen_height)
 
-                # TRƯỜNG HỢP 1: APP BỊ TẮT / VĂNG / CRASH -> TỰ BẬT LẠI NGAY LẬP TỨC
+                # TRƯỜNG HỢP 1: APP BỊ TẮT / VĂNG / CHƯA CHẠY -> BẬT LẠI KÈM CHIA LƯỚI GRID
                 if not is_alive:
                     self.package_status[pkg] = "Joining..."
                     
@@ -767,6 +784,7 @@ done
 
                     RootController.run("rm -f /sdcard/Delta/workspace/sv_heartbeat.main /sdcard/Download/sv_heartbeat.main 2>/dev/null")
 
+                    # Khởi chạy vào Game và xếp cửa sổ theo Grid Bounds
                     RootController.launch(
                         pkg,
                         target.link,
@@ -776,10 +794,10 @@ done
                     )
 
                     self._launch_timestamps[pkg] = time.monotonic()
-                    time.sleep(1.5)
+                    time.sleep(2.0)
                     continue
 
-                # TRƯỜNG HỢP 2: APP ĐANG CHẠY -> THEO DÕI SỨC KHỎE
+                # TRƯỜNG HỢP 2: APP ĐANG CHẠY -> GIÁM SÁT SỨC KHỎE WATCHDOG
                 if pkg not in self._launch_timestamps:
                     self._launch_timestamps[pkg] = time.monotonic()
 
@@ -926,9 +944,7 @@ def menu_login_cookie_lobby(config: RejoinConfig) -> None:
         else:
             return
 
-    screen_w, screen_h = RootController.get_screen_size()
     total = len(config.targets)
-
     print(f"\n{Colors.CYAN}[*] Đang đăng nhập Cookie vào SẢNH cho {total} package...{Colors.RESET}")
     for idx, target in enumerate(config.targets):
         raw_cookie = cookies[idx % len(cookies)]
@@ -944,12 +960,11 @@ def menu_login_cookie_lobby(config: RejoinConfig) -> None:
         RootController.force_stop(target.package)
         time.sleep(0.5)
 
-        bounds = target.bounds or calculate_grid_bounds(idx, total, screen_w, screen_h)
         opened = RootController.launch_lobby_only(
             target.package,
             ticket=ticket,
-            freeform=config.freeform or config.auto_arrange,
-            bounds=bounds,
+            freeform=False,
+            bounds=None,
         )
 
         if opened:
@@ -1015,11 +1030,8 @@ def interactive_dashboard():
         elif choice == "3":
             menu_choose_packages(config, DEFAULT_CONFIG_PATH)
         elif choice == "4":
-            screen_w, screen_h = RootController.get_screen_size()
-            total = len(config.targets)
-            for idx, t in enumerate(config.targets):
-                bounds = t.bounds or calculate_grid_bounds(idx, total, screen_w, screen_h)
-                RootController.launch_lobby_only(t.package, freeform=True, bounds=bounds)
+            for t in config.targets:
+                RootController.launch_lobby_only(t.package, freeform=False, bounds=None)
         elif choice == "5":
             menu_login_cookie_lobby(config)
         elif choice == "13":
