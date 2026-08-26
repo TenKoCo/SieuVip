@@ -1,7 +1,10 @@
 #!/data/data/com.termux/files/usr/bin/python
 """
-SieuVip Roblox Engine - Root Cookie Auth & Realtime Auto Rejoin System for Android.
-Tích hợp chính xác 100% cơ chế Rejoin, cURL Auth Ticket và Inject Storage gốc của Tool ban đầu.
+SieuVip Roblox Engine - Tích hợp Auto Rejoin Direct từ Tool 2 & Giữ nguyên toàn bộ tính năng Tool 3.
+Quy trình:
+1. Đóng sạch các app đang chạy ngầm.
+2. Mở lần lượt từng app lên sảnh rồi đóng lại (Warmup sạch).
+3. Rejoin trực tiếp vào Game / Server VIP qua Deep Link Intent của Tool 2 kèm giám sát Realtime Watchdog 24/7.
 """
 
 from __future__ import annotations
@@ -12,7 +15,6 @@ import html
 import json
 import logging
 from logging.handlers import RotatingFileHandler
-import math
 import os
 from pathlib import Path
 import random
@@ -20,11 +22,15 @@ import re
 import shlex
 import shutil
 import signal
+import sqlite3
+import ssl
 import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
+import urllib.request
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 try:
@@ -40,6 +46,16 @@ DEFAULT_LOCK_PATH = Path("/sdcard/Download/sieuvip_rejoin.lock")
 DEFAULT_BLOX_FRUITS_PLACE_ID = "2753915549"
 PACKAGE_RE = re.compile(r"^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+)+$")
 USER_AGENT = "Roblox/Android (Android 10; Mobile; Build/10.0)"
+
+SYSTEM_PATH = (
+    "/product/bin:/apex/com.android.runtime/bin:/apex/com.android.art/bin:"
+    "/system_ext/bin:/system/bin:/system/xbin:/odm/bin:/vendor/bin:/vendor/xbin:"
+    "/data/data/com.termux/files/usr/bin"
+)
+
+SSL_CONTEXT = ssl.create_default_context()
+SSL_CONTEXT.check_hostname = False
+SSL_CONTEXT.verify_mode = ssl.CERT_NONE
 
 
 class Colors:
@@ -87,7 +103,7 @@ class RejoinConfig:
     between_apps_seconds: float = 1.0
     retries: int = 2
     retry_backoff_seconds: float = 2.0
-    command_timeout_seconds: float = 25.0
+    command_timeout_seconds: float = 15.0
     wake_lock: bool = True
     freeform: bool = True
     auto_arrange: bool = True
@@ -106,7 +122,7 @@ class RejoinConfig:
             between_apps_seconds=float(raw.get("between_apps_seconds", 1.0)),
             retries=int(raw.get("retries", 2)),
             retry_backoff_seconds=float(raw.get("retry_backoff_seconds", 2.0)),
-            command_timeout_seconds=float(raw.get("command_timeout_seconds", 25.0)),
+            command_timeout_seconds=float(raw.get("command_timeout_seconds", 15.0)),
             wake_lock=bool(raw.get("wake_lock", True)),
             freeform=bool(raw.get("freeform", True)),
             auto_arrange=bool(raw.get("auto_arrange", True)),
@@ -150,6 +166,33 @@ def save_config(path: Path, config: RejoinConfig) -> None:
             json.dump(config.to_dict(), f, ensure_ascii=False, indent=2)
     except Exception as e:
         print(f"Lỗi lưu config: {e}")
+
+
+def setup_logger(log_path: Path) -> logging.Logger:
+    try:
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        pass
+    logger = logging.getLogger(APP_NAME)
+    logger.handlers.clear()
+    logger.setLevel(logging.DEBUG)
+    logger.propagate = False
+
+    try:
+        rotating = RotatingFileHandler(
+            log_path,
+            maxBytes=2 * 1024 * 1024,
+            backupCount=2,
+            encoding="utf-8",
+        )
+        rotating.setLevel(logging.DEBUG)
+        rotating.setFormatter(
+            logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S")
+        )
+        logger.addHandler(rotating)
+    except OSError:
+        pass
+    return logger
 
 
 class SystemMonitor:
@@ -229,117 +272,228 @@ def calculate_grid_bounds(index: int, total: int, width: int, height: int) -> st
     return f"{left},{top},{right},{bottom}"
 
 
+# ==============================================================================
+# TÍCH HỢP HÀM LAUNCH ROBLOX DIRECT TỪ TOOL (2)
+# ==============================================================================
+def parse_roblox_link_or_id(raw_input: str) -> Tuple[str, Optional[str]]:
+    """Phân tách Place ID và Link Code (Server VIP) từ chuỗi nhập vào."""
+    raw = str(raw_input).strip()
+    if raw.isdigit():
+        return raw, None
+
+    place_id = DEFAULT_BLOX_FRUITS_PLACE_ID
+    link_code = None
+
+    if "placeId=" in raw:
+        parsed = urllib.parse.urlparse(raw)
+        q = urllib.parse.parse_qs(parsed.query)
+        place_id = q.get("placeId", [DEFAULT_BLOX_FRUITS_PLACE_ID])[0]
+        if "linkCode" in q:
+            link_code = q["linkCode"][0]
+        elif "accessCode" in q:
+            link_code = q["accessCode"][0]
+        elif "privateServerLinkCode" in q:
+            link_code = q["privateServerLinkCode"][0]
+    else:
+        # Tìm các chuỗi số trong URL/Link
+        nums = re.findall(r"/games/(\d+)", raw)
+        if nums:
+            place_id = nums[0]
+        match_code = re.search(r"(?:privateServerLinkCode|linkCode|code)=([A-Za-z0-9_-]+)", raw)
+        if match_code:
+            link_code = match_code.group(1)
+
+    return place_id, link_code
+
+
+def launch_roblox_direct(
+    package: str,
+    place_id: str,
+    link_code: Optional[str] = None,
+    freeform_bounds: Optional[str] = None
+) -> Tuple[bool, str]:
+    """
+    Kích hoạt đưa tài khoản vào thẳng Server VIP hoặc Place ID theo chuẩn Tool (2).
+    Hỗ trợ kèm tuỳ chọn windowingMode Freeform nếu được thiết lập.
+    """
+    # 1. Dừng app cũ để giải phóng RAM và làm mới trạng thái
+    RootController.run(f"am force-stop {package}")
+    time.sleep(0.3)
+
+    # 2. Xây dựng đường dẫn Intent
+    params = {"placeId": str(place_id)}
+    if link_code:
+        params["linkCode"] = str(link_code)
+
+    query = urllib.parse.urlencode(params)
+    deep_link = f"roblox://experiences/start?{query}"
+
+    # 3. Tùy chọn Freeform Bounds (nếu có)
+    opt = ""
+    if freeform_bounds:
+        opt = f"--windowingMode 5 --bounds {freeform_bounds}"
+
+    # 4. Kích hoạt Intent bằng quyền Root
+    cmd = (
+        f"am start -W {opt} "
+        f"-a android.intent.action.VIEW "
+        f"-d '{deep_link}' "
+        f"-p {package}"
+    )
+
+    ok, out = RootController.run(cmd)
+    if ok and "error" not in out.lower():
+        return True, "Khởi chạy vào Server thành công"
+    return False, f"Lỗi: {out}"
+
+
 class RobloxAuthSystem:
-    """Xử lý xác thực, kiểm tra Cookie và tạo Auth Ticket qua cURL gốc chuẩn xác."""
+    """Xử lý xác thực Cookie và tạo Auth Ticket qua API Roblox."""
 
     @staticmethod
     def clean_cookie(raw: str) -> str:
-        cookie = str(raw).strip().strip("'\"")
-        match = re.search(r"(?i)\.ROBLOSECURITY\s*=\s*([^;\s]+)", cookie)
+        s = str(raw).strip().strip("'\"")
+        match = re.search(r"(?i)\.ROBLOSECURITY\s*=\s*([^;\s]+)", s)
         if match:
-            cookie = match.group(1).strip()
-        if "_|WARNING:" in cookie:
-            parts = cookie.split("|_")
-            cookie = parts[-1].strip() if len(parts) > 1 else cookie
-        if ":" in cookie and not cookie.startswith("http"):
-            parts = cookie.split(":")
+            return match.group(1).strip()
+        if "_|WARNING:" in s:
+            parts = s.split("|_")
+            return parts[-1].strip() if len(parts) > 1 else s
+        if ":" in s and not s.startswith("http"):
+            parts = s.split(":")
             for p in reversed(parts):
-                if len(p.strip()) > 100:
-                    return p.strip()
-        elif "|" in cookie:
-            parts = cookie.split("|")
+                p = p.strip()
+                if len(p) > 100:
+                    return p
+        elif "|" in s:
+            parts = s.split("|")
             for p in reversed(parts):
-                if len(p.strip()) > 100:
-                    return p.strip()
-        return re.sub(r"\\([_.|\-])", r"\1", cookie)
+                p = p.strip()
+                if len(p) > 100:
+                    return p
+        return s
 
     @classmethod
-    def get_auth_ticket(cls, cookie: str) -> Tuple[bool, Optional[str], Optional[str], str]:
-        token = cls.clean_cookie(cookie)
+    def get_auth_ticket(cls, raw_cookie: str) -> Tuple[bool, Optional[str], Optional[str], str]:
+        token = cls.clean_cookie(raw_cookie)
         if len(token) < 50:
             return False, None, None, "Cookie quá ngắn hoặc không hợp lệ"
 
-        # 1. Kiểm tra danh tính User
-        cmd_user = [
-            "curl", "-s", "-m", "10",
-            "https://users.roblox.com/v1/users/authenticated",
-            "-H", f"Cookie: .ROBLOSECURITY={token}",
-            "-H", f"User-Agent: {USER_AGENT}",
-            "-H", "Accept: application/json"
-        ]
-        res_user = subprocess.run(cmd_user, capture_output=True, text=True)
+        # 1. Lấy Username
         try:
-            user_data = json.loads(res_user.stdout)
-            if "name" not in user_data:
-                return False, None, None, "Cookie đã hết hạn hoặc bị khoá"
-            username = user_data["name"]
+            req_user = urllib.request.Request(
+                "https://users.roblox.com/v1/users/authenticated",
+                headers={
+                    "Cookie": f".ROBLOSECURITY={token}",
+                    "User-Agent": USER_AGENT,
+                    "Accept": "application/json",
+                },
+            )
+            with urllib.request.urlopen(req_user, timeout=8, context=SSL_CONTEXT) as resp:
+                user_data = json.loads(resp.read().decode("utf-8", errors="replace"))
+                username = user_data.get("name")
         except Exception:
-            return False, None, None, "Không kết nối được tới API Roblox"
+            return False, None, None, "Cookie hết hạn hoặc không kết nối được Roblox API"
 
-        # 2. Lấy x-csrf-token
-        cmd_csrf = [
-            "curl", "-s", "-i", "-m", "10",
-            "-X", "POST", "https://auth.roblox.com/v1/authentication-ticket/",
-            "-H", f"Cookie: .ROBLOSECURITY={token}",
-            "-H", f"User-Agent: {USER_AGENT}",
-            "-H", "Origin: https://www.roblox.com",
-            "-H", "Referer: https://www.roblox.com/",
-            "-H", "Content-Length: 0"
-        ]
-        res_csrf = subprocess.run(cmd_csrf, capture_output=True, text=True)
-        csrf_match = re.search(r"(?i)x-csrf-token:\s*([^\r\n]+)", res_csrf.stdout)
-        if not csrf_match:
+        if not username:
+            return False, None, None, "Không xác thực được tài khoản"
+
+        # 2. Lấy CSRF Token
+        try:
+            req_csrf = urllib.request.Request(
+                "https://auth.roblox.com/v1/authentication-ticket/",
+                data=b"{}",
+                headers={
+                    "Cookie": f".ROBLOSECURITY={token}",
+                    "User-Agent": USER_AGENT,
+                    "Origin": "https://www.roblox.com",
+                    "Referer": "https://www.roblox.com/",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            csrf_token = None
+            try:
+                with urllib.request.urlopen(req_csrf, timeout=8, context=SSL_CONTEXT) as resp:
+                    csrf_token = resp.headers.get("x-csrf-token")
+            except urllib.error.HTTPError as err:
+                csrf_token = err.headers.get("x-csrf-token")
+        except Exception as err:
+            return False, username, None, f"Lỗi CSRF: {err}"
+
+        if not csrf_token:
             return False, username, None, "Không lấy được x-csrf-token"
-        csrf_token = csrf_match.group(1).strip()
 
         # 3. Yêu cầu cấp Auth Ticket
-        cmd_ticket = [
-            "curl", "-s", "-i", "-m", "10",
-            "-X", "POST", "https://auth.roblox.com/v1/authentication-ticket/",
-            "-H", f"Cookie: .ROBLOSECURITY={token}",
-            "-H", f"x-csrf-token: {csrf_token}",
-            "-H", "RBXAuthenticationNegotiation: 1",
-            "-H", f"User-Agent: {USER_AGENT}",
-            "-H", "Origin: https://www.roblox.com",
-            "-H", "Referer: https://www.roblox.com/",
-            "-H", "Content-Type: application/json",
-            "-d", "{}"
-        ]
-        res_ticket = subprocess.run(cmd_ticket, capture_output=True, text=True)
-        ticket_match = re.search(r"(?i)rbx-authentication-ticket:\s*([^\r\n]+)", res_ticket.stdout)
-        if ticket_match:
-            return True, username, ticket_match.group(1).strip(), "Cấp Ticket thành công"
-        return False, username, None, "Roblox từ chối cấp ticket"
+        try:
+            req_ticket = urllib.request.Request(
+                "https://auth.roblox.com/v1/authentication-ticket/",
+                data=b"{}",
+                headers={
+                    "Cookie": f".ROBLOSECURITY={token}",
+                    "x-csrf-token": csrf_token,
+                    "RBXAuthenticationNegotiation": "1",
+                    "User-Agent": USER_AGENT,
+                    "Origin": "https://www.roblox.com",
+                    "Referer": "https://www.roblox.com/",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(req_ticket, timeout=8, context=SSL_CONTEXT) as resp:
+                ticket = resp.headers.get("rbx-authentication-ticket")
+                if ticket:
+                    return True, username, ticket.strip(), "Cấp Ticket thành công"
+                body = resp.read().decode("utf-8", errors="replace")
+                try:
+                    data = json.loads(body)
+                    if "authenticationTicket" in data:
+                        return True, username, str(data["authenticationTicket"]).strip(), "Cấp Ticket thành công"
+                except Exception:
+                    pass
+        except Exception as err:
+            return False, username, None, f"Lỗi lấy Ticket: {err}"
+
+        return False, username, None, "Roblox từ chối cấp Auth Ticket"
 
 
 class RootController:
-    """Thực thi các lệnh can thiệp hệ thống qua quyền Root (su) theo chuẩn tool gốc."""
-
-    PROTECTED_PACKAGES = {
-        "com.termux",
-        "com.termux.boot",
-        "com.termux.api",
-        "com.termux.styling",
-        "com.termux.gui",
-        "android",
-        "com.android.systemui",
-        "com.android.settings",
-        "com.android.launcher",
-        "com.google.android.inputmethod.latin",
-        "com.google.android.gms",
-    }
+    """Thực thi các lệnh Android sạch sẽ, loại bỏ hoàn toàn biến môi trường Termux gây lỗi."""
 
     @staticmethod
-    def run(cmd: str, timeout: float = 15.0) -> Tuple[bool, str]:
+    def _clean_env() -> Dict[str, str]:
+        env = os.environ.copy()
+        env.pop("LD_PRELOAD", None)
+        env.pop("LD_LIBRARY_PATH", None)
+        env["PATH"] = SYSTEM_PATH
+        return env
+
+    @classmethod
+    def run(cls, cmd: str, timeout: float = 10.0) -> Tuple[bool, str]:
+        env = cls._clean_env()
         try:
-            res = subprocess.run(
-                ["su", "-c", cmd],
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                check=False
-            )
-            return res.returncode == 0, (res.stdout + "\n" + res.stderr).strip()
+            if os.geteuid() == 0:
+                res = subprocess.run(
+                    ["sh", "-c", cmd],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    env=env,
+                    check=False
+                )
+            else:
+                su_bin = shutil.which("su") or "/system/bin/su" or "/system/xbin/su" or "/sbin/su"
+                remote = f"PATH={SYSTEM_PATH} LD_PRELOAD= LD_LIBRARY_PATH= exec {cmd}"
+                res = subprocess.run(
+                    [su_bin, "-c", remote],
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    env=env,
+                    check=False
+                )
+            out = (res.stdout + "\n" + res.stderr).strip()
+            return res.returncode == 0, out
         except Exception as e:
             return False, str(e)
 
@@ -358,6 +512,11 @@ class RootController:
         return ok and bool(out.strip())
 
     @classmethod
+    def force_stop(cls, package: str) -> bool:
+        ok, _ = cls.run(f"am force-stop {package}")
+        return ok
+
+    @classmethod
     def list_installed_packages(cls) -> List[str]:
         ok, out = cls.run("pm list packages")
         if not ok:
@@ -371,21 +530,16 @@ class RootController:
         return sorted(pkgs)
 
     @classmethod
-    def force_stop(cls, package: str) -> bool:
-        pkg = str(package).strip()
-        if not pkg or "termux" in pkg.lower() or pkg.lower() in cls.PROTECTED_PACKAGES:
-            return False
-        ok, _ = cls.run(f"am force-stop {pkg}")
-        return ok
-
-    @classmethod
-    def inject_storage(cls, package: str, cookie: str) -> None:
-        """Ghi đè Cookie vào SharedPreferences XML và cấp quyền UID:GID."""
-        token = RobloxAuthSystem.clean_cookie(cookie)
+    def inject_cookies_and_session(cls, package: str, raw_cookie: str, username: Optional[str] = None) -> None:
+        """Ghi đè Cookie vào SharedPreferences và SQLite WebView, bảo đảm phân quyền UID."""
+        token = RobloxAuthSystem.clean_cookie(raw_cookie)
         full_session = (
-            f"_|WARNING:-DO-NOT-SHARE-THIS.--Sharing-this-will-allow-someone-"
-            f"to-log-into-your-account-and-rob-your-robox.--|_{token}"
+            f"_|WARNING:-DO-NOT-SHARE-THIS.--Sharing-this-will-allow-someone-to-log-into-your-account-and-rob-your-robox.--|_{token}"
+            if "_|WARNING:" not in token else token
         )
+
+        user_tag = f'<string name="username">{username}</string>' if username else ''
+
         script = f"""
 pkg="{package}"
 app_dir="/data/data/$pkg"
@@ -393,13 +547,16 @@ app_dir="/data/data/$pkg"
 if [ -d "$app_dir" ]; then
     owner=$(stat -c '%u:%g' "$app_dir" 2>/dev/null || echo "10000:10000")
     mkdir -p "$app_dir/shared_prefs"
-    for xml in "com.roblox.client_preferences.xml" "${{pkg}}_preferences.xml"; do
+    for xml in "com.roblox.client_preferences.xml" "${{pkg}}_preferences.xml" "AppStorage.xml"; do
         cat << 'EOF_XML' > "$app_dir/shared_prefs/$xml"
 <?xml version='1.0' encoding='utf-8' standalone='yes' ?>
 <map>
     <string name="RBXSession">{full_session}</string>
     <string name="RBXSessionToken">{full_session}</string>
     <string name=".ROBLOSECURITY">{token}</string>
+    <boolean name="isLoggedIn" value="true" />
+    <string name="GuestData">{token}</string>
+    {user_tag}
 </map>
 EOF_XML
         chmod 660 "$app_dir/shared_prefs/$xml"
@@ -409,47 +566,6 @@ EOF_XML
 fi
 """
         cls.run(script)
-
-    @classmethod
-    def launch(
-        cls,
-        package: str,
-        link_or_id: str,
-        ticket: Optional[str] = None,
-        freeform: bool = False,
-        bounds: Optional[str] = None,
-    ) -> bool:
-        """Khởi chạy ứng dụng qua Deep Link Intent kèm Ticket và Freeform Bounds."""
-        cls.force_stop(package)
-        time.sleep(0.5)
-
-        raw = link_or_id.strip()
-        params: Dict[str, str] = {}
-        if raw.isdigit():
-            params["placeId"] = raw
-        elif "placeId=" in raw:
-            parsed = urllib.parse.urlparse(raw)
-            q = urllib.parse.parse_qs(parsed.query)
-            params["placeId"] = q.get("placeId", [DEFAULT_BLOX_FRUITS_PLACE_ID])[0]
-            if "linkCode" in q:
-                params["linkCode"] = q["linkCode"][0]
-        else:
-            params["placeId"] = DEFAULT_BLOX_FRUITS_PLACE_ID
-
-        if ticket:
-            params["ticket"] = ticket
-
-        deep_link = f"roblox://experiences/start?{urllib.parse.urlencode(params)}"
-        
-        opt = ""
-        if freeform and bounds:
-            opt = f"--windowingMode 5 --bounds {bounds}"
-        elif freeform:
-            opt = "--windowingMode 5"
-
-        cmd = f"am start -W {opt} -a android.intent.action.VIEW -d '{deep_link}' -p {package}"
-        ok, out = cls.run(cmd)
-        return ok and "error" not in out.lower()
 
     @classmethod
     def launch_lobby_only(
@@ -507,10 +623,11 @@ def mask_username(username: Optional[str]) -> str:
 
 
 class RealtimeDashboardEngine:
-    """Engine giám sát thời gian thực: Tắt sạch nền -> Warmup sạch -> Rejoin vào game kèm chia lưới."""
+    """Engine giám sát thời gian thực: Tắt sạch nền -> Warmup sạch -> Rejoin trực tiếp theo Tool (2)."""
 
-    def __init__(self, config: RejoinConfig) -> None:
+    def __init__(self, config: RejoinConfig, logger: logging.Logger) -> None:
         self.config = config
+        self.logger = logger
         self.stop_requested = False
         self._ping_paths: Dict[str, str] = {}
         self._launch_timestamps: Dict[str, float] = {}
@@ -662,21 +779,20 @@ done
         sys.stdout.flush()
 
     def _startup_sequence(self, enabled: List[TargetConfig]) -> None:
-        """Quy trình khởi tạo CHỈ áp dụng cho các package đã chọn ở Mục 3:
-        1. Đóng app nếu đang mở ngầm.
-        2. Mở lần lượt từng app lên sảnh rồi đóng lại (Warmup sạch).
+        """Quy trình khởi tạo:
+        1. Đóng sạch app chạy ngầm.
+        2. Mở lần lượt từng app lên rồi đóng lại (Warmup sạch).
         """
-        # BƯỚC 0: ĐÓNG APP NẾU ĐANG CHẠY NGẦM (CHỈ ĐÓNG PACKAGE MỤC 3)
+        # BƯỚC 0: ĐÓNG SẠCH TẤT CẢ APP NẾU ĐANG MỞ NGẦM
         for target in enabled:
             if self.stop_requested:
                 break
             pkg = target.package
-            if RootController.is_running(pkg):
-                self.package_status[pkg] = "Closing..."
-                RootController.force_stop(pkg)
-                time.sleep(0.3)
+            self.package_status[pkg] = "Closing..."
+            RootController.force_stop(pkg)
+            time.sleep(0.3)
 
-        # BƯỚC 1: MỞ LẦN LƯỢT TỪNG APP LÊN SẢNH RỒI ĐÓNG LẠI
+        # BƯỚC 1: MỞ LẦN LƯỢT TỪNG APP (KHÔNG JOIN GAME, KHÔNG SORT) RỒI ĐÓNG LẠI
         for target in enabled:
             if self.stop_requested:
                 break
@@ -685,10 +801,10 @@ done
             RootController.launch_lobby_only(pkg, freeform=False, bounds=None)
             time.sleep(2.5)
             
-            # Đóng app vừa warmup
+            # Đóng app
             self.package_status[pkg] = "Closing..."
             RootController.force_stop(pkg)
-            time.sleep(0.6)
+            time.sleep(0.8)
             self.package_status[pkg] = "Waiting..."
 
     def _worker_loop(self) -> None:
@@ -699,7 +815,7 @@ done
         # THỰC THI QUY TRÌNH DỌN DẸP & WARMUP BAN ĐẦU
         self._startup_sequence(enabled)
 
-        # GIAI ĐOẠN 2: REJOIN TỪNG APP VÀO GAME KÈM SORT / CHIA LƯỚI
+        # GIAI ĐOẠN 2: REJOIN TỪNG APP VÀO GAME BẰNG HÀM LAUNCH ROBLOX DIRECT (TOOL 2)
         while not self.stop_requested:
             for idx, target in enumerate(enabled):
                 if self.stop_requested:
@@ -713,32 +829,27 @@ done
                 if (self.config.auto_arrange or not calculated_bounds) and total_enabled > 0:
                     calculated_bounds = calculate_grid_bounds(idx, total_enabled, self.screen_width, self.screen_height)
 
-                # TRƯỜNG HỢP 1: APP BỊ TẮT / VĂNG / CHƯA CHẠY -> BẬT LẠI KÈM CHIA LƯỚI GRID
+                # TRƯỜNG HỢP 1: APP BỊ TẮT / VĂNG / CHƯA CHẠY -> SỬ DỤNG LAUNCH DIRECT TỪ TOOL (2)
                 if not is_alive:
                     self.package_status[pkg] = "Joining..."
                     
-                    ticket = None
-                    raw_c = None
-                    if cookies:
+                    # Nếu có cookie, inject session
+                    if cookies and self.config.auto_login_cookies:
                         raw_c = cookies[idx % len(cookies)]
-                        ok, user, tk, _ = RobloxAuthSystem.get_auth_ticket(raw_c)
-                        if ok and tk:
-                            ticket = tk
-                            if user:
-                                self.package_users[pkg] = mask_username(user)
-
-                    if raw_c:
-                        RootController.inject_storage(pkg, raw_c)
+                        RootController.inject_cookies_and_session(pkg, raw_c, self.package_users.get(pkg))
 
                     RootController.run("rm -f /sdcard/Delta/workspace/sv_heartbeat.main /sdcard/Download/sv_heartbeat.main 2>/dev/null")
 
-                    # Khởi chạy theo đúng hàm launch gốc của tool ban đầu
-                    RootController.launch(
-                        pkg,
-                        target.link,
-                        ticket=ticket,
-                        freeform=self.config.freeform or self.config.auto_arrange,
-                        bounds=calculated_bounds,
+                    # Phân tích Place ID và Link Code từ cấu hình
+                    place_id, link_code = parse_roblox_link_or_id(target.link)
+                    bounds_opt = calculated_bounds if (self.config.freeform or self.config.auto_arrange) else None
+
+                    # GỌI TRỰC TIẾP HÀM LAUNCH ROBLOX DIRECT CỦA TOOL (2)
+                    ok, msg = launch_roblox_direct(
+                        package=pkg,
+                        place_id=place_id,
+                        link_code=link_code,
+                        freeform_bounds=bounds_opt
                     )
 
                     self._launch_timestamps[pkg] = time.monotonic()
@@ -839,16 +950,8 @@ def menu_choose_packages(config: RejoinConfig, path: Path) -> None:
                 selected = [user_apps[int(choice) - 1]]
             elif PACKAGE_RE.fullmatch(choice):
                 selected = [choice]
-
-    # Lọc bỏ hoàn toàn Termux và các package hệ thống
-    selected = [
-        p for p in selected
-        if "termux" not in p.lower() and p.lower() not in RootController.PROTECTED_PACKAGES
-    ]
-
-    if not selected:
-        print(f"{Colors.RED}[!] Không có package Roblox hợp lệ nào được chọn.{Colors.RESET}")
-        return
+            else:
+                return
 
     print(f"\n{Colors.GREEN}[+] Đã tìm thấy {len(selected)} package:{Colors.RESET}")
     for p in selected:
@@ -912,7 +1015,7 @@ def menu_login_cookie_lobby(config: RejoinConfig) -> None:
             continue
 
         print(f"{Colors.GREEN}[+] Tài khoản: {user} | Lấy Auth Ticket thành công!{Colors.RESET}")
-        RootController.inject_storage(target.package, raw_cookie)
+        RootController.inject_cookies_and_session(target.package, raw_cookie, user)
         RootController.force_stop(target.package)
         time.sleep(0.5)
 
@@ -959,6 +1062,7 @@ def menu_advanced_config(config: RejoinConfig, path: Path) -> None:
 
 def interactive_dashboard():
     config = load_config(DEFAULT_CONFIG_PATH)
+    logger = setup_logger(DEFAULT_LOG_PATH)
 
     while True:
         sys.stdout.write("\033[2J\033[3J\033[H")
@@ -978,7 +1082,7 @@ def interactive_dashboard():
         if choice == "0":
             break
         elif choice == "1":
-            dashboard = RealtimeDashboardEngine(config)
+            dashboard = RealtimeDashboardEngine(config, logger)
             dashboard.run()
         elif choice == "2":
             menu_set_link(config, DEFAULT_CONFIG_PATH)
