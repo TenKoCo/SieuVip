@@ -2,7 +2,7 @@
 """
 SieuVip Roblox Engine - Root Cookie Auth & Realtime Auto Rejoin System for Android.
 Quy trình chuẩn:
-1. Đóng sạch các app đang chạy ngầm.
+1. Đóng sạch app mục 3 nếu đang chạy ngầm.
 2. Mở lần lượt từng app lên sảnh rồi đóng lại (Warmup sạch, không sort, không join game).
 3. Rejoin lần lượt từng app vào game kèm chia lưới ô cửa sổ nổi (Grid Freeform) và kích hoạt Watchdog 24/7.
 """
@@ -383,7 +383,7 @@ class RobloxAuthSystem:
 
 
 class RootController:
-    """Thực thi các lệnh Android sạch sẽ, loại bỏ hoàn toàn biến môi trường Termux gây lỗi."""
+    """Thực thi các lệnh Android qua Root sạch sẽ, tương thích 100% UgPhone."""
 
     @staticmethod
     def _clean_env() -> Dict[str, str]:
@@ -397,26 +397,15 @@ class RootController:
     def run(cls, cmd: str, timeout: float = 10.0) -> Tuple[bool, str]:
         env = cls._clean_env()
         try:
-            if os.geteuid() == 0:
-                res = subprocess.run(
-                    ["sh", "-c", cmd],
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout,
-                    env=env,
-                    check=False
-                )
-            else:
-                su_bin = shutil.which("su") or "/system/bin/su" or "/system/xbin/su" or "/sbin/su"
-                remote = f"PATH={SYSTEM_PATH} LD_PRELOAD= LD_LIBRARY_PATH= exec {cmd}"
-                res = subprocess.run(
-                    [su_bin, "-c", remote],
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout,
-                    env=env,
-                    check=False
-                )
+            su_bin = shutil.which("su") or "/system/bin/su" or "/system/xbin/su" or "/sbin/su"
+            res = subprocess.run(
+                [su_bin, "-c", cmd],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=env,
+                check=False
+            )
             out = (res.stdout + "\n" + res.stderr).strip()
             return res.returncode == 0, out
         except Exception as e:
@@ -537,40 +526,47 @@ fi
             params["ticket"] = ticket
 
         deep_link = f"roblox://experiences/start?{urllib.parse.urlencode(params)}"
-        deep_link_short = f"roblox://{urllib.parse.urlencode(params)}"
 
-        opt_variants = []
+        opt = ""
         if freeform and bounds:
-            opt_variants.append(f"--windowingMode 5 --bounds {bounds}")
-        if freeform:
-            opt_variants.append("--windowingMode 5")
-        opt_variants.append("")
+            opt = f"--windowingMode 5 --bounds {bounds}"
+        elif freeform:
+            opt = "--windowingMode 5"
 
-        intents_to_try = [
-            # 1. Deep link URL standard
-            lambda opt: f"am start {opt} -a android.intent.action.VIEW -d '{deep_link}' -p {package}",
-            # 2. Short Deep Link
-            lambda opt: f"am start {opt} -a android.intent.action.VIEW -d '{deep_link_short}' -p {package}",
-            # 3. Explicit launcher with intent
-            lambda opt: f"am start {opt} -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p {package}",
-        ]
+        # 1. Thử Deep link chuẩn với Windowing Mode
+        cmd1 = f"am start -W {opt} -a android.intent.action.VIEW -d '{deep_link}' -p {package}"
+        ok1, out1 = cls.run(cmd1)
+        if ok1 and "error" not in out1.lower():
+            if freeform and bounds:
+                time.sleep(0.3)
+                cls.apply_task_bounds(package, bounds)
+            return True
 
-        for intent_fn in intents_to_try:
-            for opt in opt_variants:
-                cmd = intent_fn(opt).strip()
-                ok, out = cls.run(cmd)
-                if ok and "error" not in out.lower() and "unable to resolve" not in out.lower():
-                    if freeform and bounds:
-                        time.sleep(0.3)
-                        cls.apply_task_bounds(package, bounds)
-                    return True
+        # 2. Thử Deep link không có opt
+        cmd2 = f"am start -W -a android.intent.action.VIEW -d '{deep_link}' -p {package}"
+        ok2, out2 = cls.run(cmd2)
+        if ok2 and "error" not in out2.lower():
+            if freeform and bounds:
+                time.sleep(0.4)
+                cls.apply_task_bounds(package, bounds)
+            return True
 
-        # Fallback cuối cùng: Monkey Launcher
-        cls.run(f"monkey -p {package} -c android.intent.category.LAUNCHER 1")
+        # 3. Fallback mở Launcher
+        cmd3 = f"am start -W {opt} -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p {package}"
+        ok3, out3 = cls.run(cmd3)
+        if ok3 and "error" not in out3.lower():
+            if freeform and bounds:
+                time.sleep(0.4)
+                cls.apply_task_bounds(package, bounds)
+            return True
+
+        # 4. Fallback Launcher chuẩn
+        cmd4 = f"am start -W -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p {package}"
+        ok4, _ = cls.run(cmd4)
         if freeform and bounds:
             time.sleep(0.4)
             cls.apply_task_bounds(package, bounds)
-        return True
+        return ok4
 
     @classmethod
     def launch_lobby_only(
