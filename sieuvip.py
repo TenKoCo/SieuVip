@@ -784,20 +784,21 @@ done
         sys.stdout.flush()
 
     def _startup_sequence(self, enabled: List[TargetConfig]) -> None:
-        """Quy trình khởi tạo:
-        1. Đóng sạch app chạy ngầm.
-        2. Mở lần lượt từng app lên rồi đóng lại (Warmup sạch).
+        """Quy trình khởi tạo CHỈ áp dụng cho các package đã chọn ở Mục 3:
+        1. Đóng app nếu đang mở ngầm.
+        2. Mở lần lượt từng app lên sảnh rồi đóng lại (Warmup sạch).
         """
-        # BƯỚC 0: ĐÓNG SẠCH TẤT CẢ APP NẾU ĐANG MỞ NGẦM
+        # BƯỚC 0: ĐÓNG APP NẾU ĐANG CHẠY NGẦM (CHỈ ĐÓNG PACKAGE MỤC 3)
         for target in enabled:
             if self.stop_requested:
                 break
             pkg = target.package
-            self.package_status[pkg] = "Closing..."
-            RootController.force_stop(pkg)
-            time.sleep(0.3)
+            if RootController.is_running(pkg):
+                self.package_status[pkg] = "Closing..."
+                RootController.force_stop(pkg)
+                time.sleep(0.4)
 
-        # BƯỚC 1: MỞ LẦN LƯỢT TỪNG APP (KHÔNG JOIN GAME, KHÔNG SORT) RỒI ĐÓNG LẠI
+        # BƯỚC 1: MỞ LẦN LƯỢT TỪNG APP LÊN SẢNH RỒI ĐÓNG LẠI
         for target in enabled:
             if self.stop_requested:
                 break
@@ -806,7 +807,7 @@ done
             RootController.launch_lobby_only(pkg, freeform=False, bounds=None)
             time.sleep(2.5)
             
-            # Đóng app
+            # Đóng app vừa warmup
             self.package_status[pkg] = "Closing..."
             RootController.force_stop(pkg)
             time.sleep(0.8)
